@@ -3,16 +3,6 @@ SoftViz Pro: Implementation & Technical Overview
 
 SoftViz Pro is a viewport overlay for Blender 4.5 and 5 designed to bridge the feedback gap in the Proportional Editing workflow. While Blender’s native tool uses a 2D circle to represent a 3D influence, SoftViz calculates and draws a per-vertex heatmap directly onto the geometry (similar to 3dsMax, maya,...).
 
-Installation:
-	Download the SoftViz_Pro.zip.
-
-	In Blender, navigate to Edit > Preferences > Add-ons.
-
-	Click Install from Disk, select the .zip, and enable the add-on.
-
-	Access the settings via the SoftViz tab in the 3D Viewport N-Panel.
-
-
 ---
 Usage:
 	Access the settings via the SoftViz tab in the 3D Viewport N-Panel.
