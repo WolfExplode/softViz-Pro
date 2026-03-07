@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "softviz_pro"
+version = "1.0.0"
+name = "SoftViz Pro"
+tagline = "GPU-accelerated heatmap visualizer for Proportional Editing"
+maintainer = "Niels Couvreur"
+type = "add-on"
+
+tags = ["Mesh", "3D View"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
