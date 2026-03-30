@@ -52,3 +52,14 @@ Operational Note:
 ---
 Update Behavior: 
 	The heatmap remains static during the scroll and will instantly recalculate and snap to the correct size as soon as the transform is confirmed (left-click/Enter) or the mouse 	pause-timer (0.2s) expires.
+
+---
+Modifier “Display in Edit Mode” (limitations):
+
+	SoftViz aligns the overlay with evaluated vertex positions when a deform modifier (e.g. Armature) has both viewport visibility (eye icon) and “Display in Edit Mode” enabled. That matches the cage you edit for those modifiers.
+
+	Subdivision Surface, Multires, and other modifiers that change vertex count are not supported for cage alignment: Blender’s Python API does not expose the on-cage positions mapped back to original mesh indices. If only those modifiers use “Display in Edit Mode”, SoftViz keeps using base mesh positions (the heatmap ignores that display).
+
+	If Armature (or another supported deform modifier) and Subdivision both show in edit mode, SoftViz temporarily clears “Display in Edit Mode” on known topology-changing modifiers only while it samples the evaluated mesh each frame, then restores your settings. That way Armature deformation still applies to the overlay without a vertex-count mismatch. Subdivision cage positions remain a Blender limitation for the overlay.
+
+	On Cage (Subdivision): the viewport may still show handles on the subdivided surface; SoftViz dots follow the mesh used for evaluation after that brief suppression (deform stack), not the subdivided cage wire.

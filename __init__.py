@@ -270,17 +270,48 @@ def falloff(d, mode):
 # -------------------------------------------------
 # MODIFIER CAGE / EVALUATED MESH (align with edit-mode display)
 # -------------------------------------------------
+# Deform modifiers that keep a 1:1 mapping to mesh verts — safe to read from
+# evaluated mesh positions. Subdivision / Multires / etc. are NOT listed here
+# so enabling "Display in Edit Mode" on them alone does not turn on cage eval
+# (Blender Python cannot match cage verts to original indices).
+_DEFORM_MODIFIER_EDIT_TYPES = frozenset({
+    'ARMATURE', 'CAST', 'CURVE', 'DISPLACE', 'HOOK', 'LAPLACIANDEFORM',
+    'LATTICE', 'MESH_DEFORM', 'SHRINKWRAP', 'SIMPLE_DEFORM', 'SMOOTH',
+    'CORRECTIVE_SMOOTH', 'SURFACE_DEFORM', 'WARP', 'WAVE',
+})
+
+# Modifiers that usually change vert count when stacked — temporarily turn off
+# "show in edit mode" only while sampling evaluated coords so Armature etc.
+# still resolve (API evaluates full stack; without this, count mismatch → no cage).
+_TOPOLOGY_EDITDISPLAY_MODS = frozenset({
+    'SUBSURF', 'MULTIRES', 'MIRROR', 'ARRAY', 'BOOLEAN', 'BUILD',
+    'DECIMATE', 'REMESH', 'NODES', 'WELD', 'WIREFRAME', 'SKIN',
+    'BEVEL', 'SCREW', 'SOLIDIFY',
+})
+
 def modifier_edit_display_signature(obj):
     return tuple(
         (m.name, m.type, m.show_viewport, m.show_in_editmode)
         for m in obj.modifiers
     )
 
-def object_uses_modifier_edit_display(obj):
+def object_needs_evaluated_deform_cage(obj):
     for mod in obj.modifiers:
         if mod.show_viewport and mod.show_in_editmode:
-            return True
+            if mod.type in _DEFORM_MODIFIER_EDIT_TYPES:
+                return True
     return False
+
+def topology_edit_display_warning_lines(context):
+    lines = []
+    for obj in context.objects_in_mode:
+        if obj.type != 'MESH':
+            continue
+        for mod in obj.modifiers:
+            if (mod.show_viewport and mod.show_in_editmode
+                    and mod.type in _TOPOLOGY_EDITDISPLAY_MODS):
+                lines.append(f"{obj.name}: {mod.name} ({mod.type})")
+    return lines
 
 def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
     eval_obj = obj.evaluated_get(depsgraph)
@@ -295,6 +326,21 @@ def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
         return [mw @ me.vertices[i].co.copy() for i in range(len(me.vertices))]
     finally:
         eval_obj.to_mesh_clear()
+
+def eval_vert_world_coords_for_draw_cage(obj, ctx, expected_vert_count):
+    restored = []
+    try:
+        for mod in obj.modifiers:
+            if mod.show_viewport and mod.show_in_editmode and mod.type in _TOPOLOGY_EDITDISPLAY_MODS:
+                restored.append((mod, mod.show_in_editmode))
+                mod.show_in_editmode = False
+        if restored:
+            ctx.view_layer.update()
+        depsgraph = ctx.evaluated_depsgraph_get()
+        return eval_vert_world_coords(obj, depsgraph, expected_vert_count)
+    finally:
+        for mod, prev in restored:
+            mod.show_in_editmode = prev
 
 def vert_world_pos(mat, v, cage_coords):
     if cage_coords is not None and v.index < len(cage_coords):
@@ -333,12 +379,12 @@ def draw_callback():
     for obj in edit_objs:
         bms[obj] = bmesh.from_edit_mesh(obj.data)
 
-    depsgraph = ctx.evaluated_depsgraph_get()
     live_tf = transform_modal_active(ctx)
     cage_coords_by_obj = {}
     for obj in edit_objs:
-        if object_uses_modifier_edit_display(obj) or live_tf:
-            c = eval_vert_world_coords(obj, depsgraph, len(obj.data.vertices))
+        if object_needs_evaluated_deform_cage(obj):
+            c = eval_vert_world_coords_for_draw_cage(
+                obj, ctx, len(obj.data.vertices))
             if c is not None:
                 cage_coords_by_obj[obj] = c
 
@@ -728,11 +774,26 @@ class VIEW3D_PT_softviz(bpy.types.Panel):
     bl_category = 'SoftViz'
 
     def draw(self, context):
-        self.layout.operator(
+        l = self.layout
+        l.operator(
             "view3d.softviz_toggle",
             depress=context.scene.softviz_running,
             icon='PARTICLES',
         )
+        if context.mode == 'EDIT_MESH':
+            warn = topology_edit_display_warning_lines(context)
+            if warn:
+                box = l.box()
+                box.alert = True
+                box.label(
+                    text='Topology modifier uses "Display Modifier in Edit Mode":',
+                    icon='INFO',
+                )
+                for line in warn[:6]:
+                    box.label(text=line)
+                if len(warn) > 6:
+                    box.label(text=f"… +{len(warn) - 6} more")
+                box.label(text="SoftViz cannot match subdiv/cage verts to mesh indices.")
 
 
 class VIEW3D_PT_softviz_display(bpy.types.Panel):
