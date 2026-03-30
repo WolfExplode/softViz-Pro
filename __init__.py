@@ -259,6 +259,40 @@ def falloff(d, mode):
     return 1-d
 
 # -------------------------------------------------
+# MODIFIER CAGE / EVALUATED MESH (align with edit-mode display)
+# -------------------------------------------------
+def modifier_edit_display_signature(obj):
+    return tuple(
+        (m.name, m.type, m.show_viewport, m.show_in_editmode)
+        for m in obj.modifiers
+    )
+
+def object_uses_modifier_edit_display(obj):
+    for mod in obj.modifiers:
+        if mod.show_viewport and mod.show_in_editmode:
+            return True
+    return False
+
+def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
+    eval_obj = obj.evaluated_get(depsgraph)
+    try:
+        me = eval_obj.to_mesh()
+    except Exception:
+        return None
+    try:
+        if len(me.vertices) != expected_vert_count:
+            return None
+        mw = eval_obj.matrix_world
+        return [mw @ me.vertices[i].co.copy() for i in range(len(me.vertices))]
+    finally:
+        eval_obj.to_mesh_clear()
+
+def vert_world_pos(mat, v, cage_coords):
+    if cage_coords is not None and v.index < len(cage_coords):
+        return cage_coords[v.index]
+    return mat @ v.co
+
+# -------------------------------------------------
 # DRAW
 # -------------------------------------------------
 def draw_callback():
@@ -296,17 +330,29 @@ def draw_callback():
             len(bm.verts), 
             len(bm.edges), 
             sel_indices,
-            tuple(mat.col[3]) 
+            tuple(mat.col[3]),
+            modifier_edit_display_signature(obj),
         ])
         
     current_hash = hash(tuple(cache_key_elements))
 
+    depsgraph = ctx.evaluated_depsgraph_get()
+    cage_coords_by_obj = {}
+    for obj in edit_objs:
+        if object_uses_modifier_edit_display(obj):
+            c = eval_vert_world_coords(obj, depsgraph, len(obj.data.vertices))
+            if c is not None:
+                cage_coords_by_obj[obj] = c
+
     coord_elements = []
     for obj in edit_objs:
         bm = bms[obj]
+        mat = obj.matrix_world
+        cage = cage_coords_by_obj.get(obj)
         for v in bm.verts:
             if v.select:
-                coord_elements.extend([round(v.co.x, 3), round(v.co.y, 3), round(v.co.z, 3)])
+                wp = vert_world_pos(mat, v, cage)
+                coord_elements.extend([round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)])
     current_coord_hash = hash(tuple(coord_elements))
 
     if current_coord_hash != VIZ_CACHE.coord_hash:
@@ -332,8 +378,9 @@ def draw_callback():
         for obj in edit_objs:
             bm = bms[obj]
             mat = obj.matrix_world
+            cage = cage_coords_by_obj.get(obj)
             sel = [v for v in bm.verts if v.select]
-            global_centers.extend([mat @ v.co for v in sel])
+            global_centers.extend([vert_world_pos(mat, v, cage) for v in sel])
             VIZ_CACHE.weights[obj.name] = []
 
         if global_centers:
@@ -341,6 +388,7 @@ def draw_callback():
                 for obj in edit_objs:
                     bm = bms[obj]
                     mat = obj.matrix_world
+                    cage = cage_coords_by_obj.get(obj)
                     sel = [v for v in bm.verts if v.select]
                     if not sel: continue 
 
@@ -360,7 +408,9 @@ def draw_callback():
 
                         for edge in v.link_edges:
                             neighbor = edge.other_vert(v)
-                            edge_len = (mat @ v.co - mat @ neighbor.co).length
+                            p_v = vert_world_pos(mat, v, cage)
+                            p_n = vert_world_pos(mat, neighbor, cage)
+                            edge_len = (p_v - p_n).length
                             new_dist = dist + edge_len
 
                             if new_dist <= rad:
@@ -379,9 +429,10 @@ def draw_callback():
                 for obj in edit_objs:
                     bm = bms[obj]
                     mat = obj.matrix_world
+                    cage = cage_coords_by_obj.get(obj)
                     obj_weights = []
                     for v in bm.verts:
-                        wp = mat @ v.co
+                        wp = vert_world_pos(mat, v, cage)
                         _, _, dist = kd.find(wp)
                         if dist <= rad:
                             w = falloff(dist / rad, ts.proportional_edit_falloff)
@@ -395,15 +446,16 @@ def draw_callback():
         if obj.name not in VIZ_CACHE.weights: continue
         bm = bms[obj]
         mat = obj.matrix_world
+        cage = cage_coords_by_obj.get(obj)
         bm.verts.ensure_lookup_table() 
         
         for v_idx, w in VIZ_CACHE.weights[obj.name]:
             try:
-                wp = mat @ bm.verts[v_idx].co
+                v = bm.verts[v_idx]
+                wp = vert_world_pos(mat, v, cage)
                 vert_weights.append((wp, w))
             except IndexError:
                 pass
-
     if not vert_weights: return
 
     coords, colors, indices = [], [], []
