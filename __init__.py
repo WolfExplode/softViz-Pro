@@ -316,6 +316,31 @@ def topology_edit_display_warning_lines(context):
                 lines.append(f"{obj.name}: {mod.name} ({mod.type})")
     return lines
 
+def proportional_mirror_world_positions(obj, mat, wp, epsilon=1e-4):
+    """World positions mirrored in object-local space per mesh symmetry flags."""
+    if not (getattr(obj, "use_mesh_mirror_x", False)
+            or getattr(obj, "use_mesh_mirror_y", False)
+            or getattr(obj, "use_mesh_mirror_z", False)):
+        return (wp.copy(),)
+    inv = mat.inverted()
+    local = inv @ wp
+    opts_x = (-1.0, 1.0) if getattr(obj, "use_mesh_mirror_x", False) else (1.0,)
+    opts_y = (-1.0, 1.0) if getattr(obj, "use_mesh_mirror_y", False) else (1.0,)
+    opts_z = (-1.0, 1.0) if getattr(obj, "use_mesh_mirror_z", False) else (1.0,)
+    out = []
+    for sx in opts_x:
+        for sy in opts_y:
+            for sz in opts_z:
+                wps = mat @ Vector((local.x * sx, local.y * sy, local.z * sz))
+                dup = False
+                for p in out:
+                    if (wps - p).length <= epsilon:
+                        dup = True
+                        break
+                if not dup:
+                    out.append(wps.copy())
+    return tuple(out)
+
 def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
     eval_obj = obj.evaluated_get(depsgraph)
     try:
@@ -474,6 +499,9 @@ def draw_callback():
                 tuple(mat.col[3]),
                 modifier_edit_display_signature(obj),
                 getattr(obj, "use_shape_key_edit_mode", False),
+                getattr(obj, "use_mesh_mirror_x", False),
+                getattr(obj, "use_mesh_mirror_y", False),
+                getattr(obj, "use_mesh_mirror_z", False),
             ])
 
         current_hash = hash(tuple(cache_key_elements))
@@ -592,7 +620,8 @@ def draw_callback():
                 try:
                     v = bm.verts[v_idx]
                     wp = vert_world_pos(mat, v, cage)
-                    vert_weights.append((wp, w))
+                    for wp_sym in proportional_mirror_world_positions(obj, mat, wp):
+                        vert_weights.append((wp_sym, w))
                 except IndexError:
                     pass
 
