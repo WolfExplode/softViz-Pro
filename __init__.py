@@ -296,6 +296,9 @@ def modifier_edit_display_signature(obj):
     )
 
 def object_needs_evaluated_deform_cage(obj):
+    if obj.type == 'MESH' and obj.data.shape_keys:
+        if getattr(obj, "use_shape_key_edit_mode", False):
+            return True
     for mod in obj.modifiers:
         if mod.show_viewport and mod.show_in_editmode:
             if mod.type in _DEFORM_MODIFIER_EDIT_TYPES:
@@ -470,6 +473,7 @@ def draw_callback():
                 sel_indices,
                 tuple(mat.col[3]),
                 modifier_edit_display_signature(obj),
+                getattr(obj, "use_shape_key_edit_mode", False),
             ])
 
         current_hash = hash(tuple(cache_key_elements))
