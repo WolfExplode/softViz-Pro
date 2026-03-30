@@ -1,4 +1,4 @@
-import bpy, bmesh, gpu, json, heapq, time
+import bpy, bmesh, gpu, heapq, time
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, kdtree
 
@@ -118,124 +118,8 @@ def get_ramp_node():
     return None
 
 # -------------------------------------------------
-# PRESETS
+# RESET RAMP
 # -------------------------------------------------
-class SoftVizAddonPrefs(bpy.types.AddonPreferences):
-    bl_idname = __name__
-    presets: bpy.props.StringProperty(default="{}")
-    def draw(self, context):
-        self.layout.label(text="SoftViz Presets")
-
-def prefs():
-    return bpy.context.preferences.addons[__name__].preferences
-
-def serialize_ramp(r):
-    return [(e.position, list(e.color)) for e in r.elements]
-
-def deserialize_ramp(r, data):
-    while len(r.elements) > 1:
-        r.elements.remove(r.elements[0])
-    for i, (p, c) in enumerate(data):
-        if i == 0:
-            r.elements[0].position = p
-            r.elements[0].color = c
-        else:
-            e = r.elements.new(p)
-            e.color = c
-
-def is_same_ramp(data1, data2):
-    if len(data1) != len(data2): return False
-    for (p1, c1), (p2, c2) in zip(data1, data2):
-        if abs(p1 - p2) > 0.001: return False
-        for v1, v2 in zip(c1, c2):
-            if abs(v1 - v2) > 0.001: return False
-    return True
-
-def get_active_preset_name():
-    ramp_node = get_ramp_node()
-    if not ramp_node:
-        return None
-
-    current = serialize_ramp(ramp_node.color_ramp)
-    store = json.loads(prefs().presets)
-
-    for name, data in store.items():
-        if is_same_ramp(data, current):
-            return name
-    return None
-
-# -------------------------------------------------
-# PRESET OPERATORS
-# -------------------------------------------------
-class VIEW3D_OT_softviz_save_preset(bpy.types.Operator):
-    bl_idname = "view3d.softviz_save_preset"
-    bl_label = "Save Preset"
-    name: bpy.props.StringProperty(name="Name")
-
-    def execute(self, context):
-        ramp = get_ramp_node().color_ramp
-        store = json.loads(prefs().presets)
-        store[self.name] = serialize_ramp(ramp)
-        prefs().presets = json.dumps(store)
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
-
-class VIEW3D_OT_softviz_load_preset(bpy.types.Operator):
-    bl_idname = "view3d.softviz_load_preset"
-    bl_label = "Load Preset"
-    name: bpy.props.StringProperty()
-
-    def execute(self, context):
-        ramp = get_ramp_node().color_ramp
-        store = json.loads(prefs().presets)
-        if self.name in store:
-            deserialize_ramp(ramp, store[self.name])
-        return {'FINISHED'}
-
-class VIEW3D_OT_softviz_update_preset(bpy.types.Operator):
-    bl_idname = "view3d.softviz_update_preset"
-    bl_label = "Update Preset"
-    name: bpy.props.StringProperty()
-
-    def execute(self, context):
-        ramp = get_ramp_node().color_ramp
-        store = json.loads(prefs().presets)
-        store[self.name] = serialize_ramp(ramp)
-        prefs().presets = json.dumps(store)
-        return {'FINISHED'}
-
-class VIEW3D_OT_softviz_delete_preset(bpy.types.Operator):
-    bl_idname = "view3d.softviz_delete_preset"
-    bl_label = "Delete Preset"
-    name: bpy.props.StringProperty()
-
-    def execute(self, context):
-        store = json.loads(prefs().presets)
-        if self.name in store:
-            del store[self.name]
-            prefs().presets = json.dumps(store)
-        return {'FINISHED'}
-
-class VIEW3D_OT_softviz_rename_preset(bpy.types.Operator):
-    bl_idname = "view3d.softviz_rename_preset"
-    bl_label = "Rename Preset"
-
-    name: bpy.props.StringProperty()
-    new_name: bpy.props.StringProperty(name="New Name")
-
-    def execute(self, context):
-        store = json.loads(prefs().presets)
-        if self.name in store and self.new_name:
-            store[self.new_name] = store.pop(self.name)
-            prefs().presets = json.dumps(store)
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        self.new_name = self.name
-        return context.window_manager.invoke_props_dialog(self)
-
 class VIEW3D_OT_softviz_reset_ramp(bpy.types.Operator):
     bl_idname = "view3d.softviz_reset_ramp"
     bl_label = "Reset Ramp"
@@ -553,77 +437,63 @@ class SoftVizSettings(bpy.types.PropertyGroup):
 # -------------------------------------------------
 class VIEW3D_PT_softviz(bpy.types.Panel):
     bl_label = "SoftViz 4.5"
+    bl_idname = "VIEW3D_PT_softviz"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'SoftViz'
 
     def draw(self, context):
-        l = self.layout
-        ts = context.tool_settings
+        self.layout.operator(
+            "view3d.softviz_toggle",
+            depress=context.scene.softviz_running,
+            icon='PARTICLES',
+        )
+
+
+class VIEW3D_PT_softviz_display(bpy.types.Panel):
+    bl_label = "Display Settings"
+    bl_idname = "VIEW3D_PT_softviz_display"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'SoftViz'
+    bl_parent_id = "VIEW3D_PT_softviz"
+    bl_order = 0
+
+    def draw(self, context):
         s = context.scene.softviz_settings
-        store = json.loads(prefs().presets)
+        l = self.layout
+        l.prop(s, "use_xray")
+        l.prop(s, "use_screen_space")
+        l.prop(s, "dot_size", slider=True)
+        l.prop(s, "alpha_fade", slider=True)
 
+
+class VIEW3D_PT_softviz_colors(bpy.types.Panel):
+    bl_label = "Heatmap Colors"
+    bl_idname = "VIEW3D_PT_softviz_colors"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'SoftViz'
+    bl_parent_id = "VIEW3D_PT_softviz"
+    bl_order = 1
+
+    def draw(self, context):
         ramp_node = get_ramp_node()
-        active = get_active_preset_name()
-
-        box = l.box()
-        box.label(text="Proportional")
-        box.prop(ts, "use_proportional_edit")
-        box.prop(ts, "proportional_size")
-        box.prop(ts, "proportional_edit_falloff")
-        box.prop(ts, "use_proportional_connected")
-
-        l.operator("view3d.softviz_toggle",
-                   depress=context.scene.softviz_running,
-                   icon='PARTICLES')
-
-        box = l.box()
-        box.label(text="Display Settings")
-        box.prop(s, "use_xray")
-        box.prop(s, "use_screen_space")
-        box.prop(s, "dot_size", slider=True)
-        box.prop(s, "alpha_fade", slider=True)
-
-        box = l.box()
-        box.label(text="Heatmap Colors")
+        l = self.layout
         if ramp_node:
-            box.template_color_ramp(ramp_node, "color_ramp", expand=True)
-            box.operator("view3d.softviz_reset_ramp", icon='FILE_REFRESH')
-
-        box = l.box()
-        box.label(text="Presets")
-        box.label(text=f"Active Preset: {active if active else 'None'}")
-        box.operator("view3d.softviz_save_preset", icon='ADD')
-
-        for name in store.keys():
-            r = box.row(align=True)
-
-            op = r.operator("view3d.softviz_load_preset", text=name)
-            op.name = name
-
-            up = r.operator("view3d.softviz_update_preset", text="", icon='FILE_TICK')
-            up.name = name
-
-            rn = r.operator("view3d.softviz_rename_preset", text="", icon='GREASEPENCIL')
-            rn.name = name
-
-            de = r.operator("view3d.softviz_delete_preset", text="", icon='TRASH')
-            de.name = name
+            l.template_color_ramp(ramp_node, "color_ramp", expand=True)
+            l.operator("view3d.softviz_reset_ramp", icon='FILE_REFRESH')
 
 # -------------------------------------------------
 # REGISTER
 # -------------------------------------------------
 classes = (
-    SoftVizAddonPrefs,
     SoftVizSettings,
     VIEW3D_OT_softviz_toggle,
     VIEW3D_OT_softviz_reset_ramp,
-    VIEW3D_OT_softviz_save_preset,
-    VIEW3D_OT_softviz_load_preset,
-    VIEW3D_OT_softviz_update_preset,
-    VIEW3D_OT_softviz_rename_preset,
-    VIEW3D_OT_softviz_delete_preset,
     VIEW3D_PT_softviz,
+    VIEW3D_PT_softviz_display,
+    VIEW3D_PT_softviz_colors,
 )
 
 def register():
