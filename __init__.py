@@ -182,8 +182,11 @@ def vert_world_pos(mat, v, cage_coords):
 def draw_callback():
     ctx = bpy.context
     ts = ctx.tool_settings
-    if not ts.use_proportional_edit: return
-    
+    s = ctx.scene.softviz_settings
+
+    if s.viz_mode == 'PROPORTIONAL' and not ts.use_proportional_edit:
+        return
+
     edit_objs = [o for o in ctx.objects_in_mode if o.type == 'MESH']
     if not edit_objs: return
 
@@ -193,32 +196,10 @@ def draw_callback():
         ctx.view_layer.update()
 
     ramp = ramp_node.color_ramp if ramp_node else None
-    s = ctx.scene.softviz_settings
-    rad = ts.proportional_size
 
     bms = {}
-    cache_key_elements = [
-        ts.proportional_size,
-        ts.proportional_edit_falloff,
-        ts.use_proportional_connected
-    ]
-    
     for obj in edit_objs:
-        bm = bmesh.from_edit_mesh(obj.data)
-        bms[obj] = bm
-        mat = obj.matrix_world
-        
-        sel_indices = tuple(v.index for v in bm.verts if v.select)
-        cache_key_elements.extend([
-            obj.name, 
-            len(bm.verts), 
-            len(bm.edges), 
-            sel_indices,
-            tuple(mat.col[3]),
-            modifier_edit_display_signature(obj),
-        ])
-        
-    current_hash = hash(tuple(cache_key_elements))
+        bms[obj] = bmesh.from_edit_mesh(obj.data)
 
     depsgraph = ctx.evaluated_depsgraph_get()
     cage_coords_by_obj = {}
@@ -228,119 +209,169 @@ def draw_callback():
             if c is not None:
                 cage_coords_by_obj[obj] = c
 
-    coord_elements = []
-    for obj in edit_objs:
-        bm = bms[obj]
-        mat = obj.matrix_world
-        cage = cage_coords_by_obj.get(obj)
-        for v in bm.verts:
-            if v.select:
-                wp = vert_world_pos(mat, v, cage)
-                coord_elements.extend([round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)])
-    current_coord_hash = hash(tuple(coord_elements))
-
-    if current_coord_hash != VIZ_CACHE.coord_hash:
-        VIZ_CACHE.coord_hash = current_coord_hash
-        VIZ_CACHE.last_change_time = time.time()
-        VIZ_CACHE.is_dirty = True
-
-    rebuild = False
-    
-    if current_hash != VIZ_CACHE.hash:
-        rebuild = True 
-        VIZ_CACHE.hash = current_hash
-        VIZ_CACHE.is_dirty = False 
-        
-    elif VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
-        rebuild = True 
-        VIZ_CACHE.is_dirty = False
-
-    if rebuild:
-        VIZ_CACHE.weights.clear()
-        
-        global_centers = []
+    # ------- VERTEX GROUP mode -------
+    if s.viz_mode == 'VERTEX_GROUP':
+        vert_weights = []
         for obj in edit_objs:
             bm = bms[obj]
             mat = obj.matrix_world
             cage = cage_coords_by_obj.get(obj)
-            sel = [v for v in bm.verts if v.select]
-            global_centers.extend([vert_world_pos(mat, v, cage) for v in sel])
-            VIZ_CACHE.weights[obj.name] = []
 
-        if global_centers:
-            if ts.use_proportional_connected:
-                for obj in edit_objs:
-                    bm = bms[obj]
-                    mat = obj.matrix_world
-                    cage = cage_coords_by_obj.get(obj)
-                    sel = [v for v in bm.verts if v.select]
-                    if not sel: continue 
+            vg = obj.vertex_groups.get(s.vgroup_name) if s.vgroup_name else None
+            if not vg:
+                vg = obj.vertex_groups.active
+            if not vg:
+                continue
 
-                    distances = {v: 0.0 for v in sel}
-                    pq = [(0.0, v.index, v) for v in sel]
-                    heapq.heapify(pq)
+            dvert_layer = bm.verts.layers.deform.verify()
+            vg_idx = vg.index
+            for v in bm.verts:
+                w = v[dvert_layer].get(vg_idx, 0.0)
+                if w > 0.0:
+                    wp = vert_world_pos(mat, v, cage)
+                    vert_weights.append((wp, w))
 
-                    obj_weights = []
-                    while pq:
-                        dist, _, v = heapq.heappop(pq)
-                        
-                        if dist > distances.get(v, float('inf')): continue
+        if not vert_weights: return
 
-                        w = falloff(dist / rad, ts.proportional_edit_falloff)
-                        if w > 0.0:
-                            obj_weights.append((v.index, w))
+    # ------- PROPORTIONAL mode -------
+    else:
+        rad = ts.proportional_size
 
-                        for edge in v.link_edges:
-                            neighbor = edge.other_vert(v)
-                            p_v = vert_world_pos(mat, v, cage)
-                            p_n = vert_world_pos(mat, neighbor, cage)
-                            edge_len = (p_v - p_n).length
-                            new_dist = dist + edge_len
+        cache_key_elements = [
+            ts.proportional_size,
+            ts.proportional_edit_falloff,
+            ts.use_proportional_connected,
+        ]
 
-                            if new_dist <= rad:
-                                if new_dist < distances.get(neighbor, float('inf')):
-                                    distances[neighbor] = new_dist
-                                    heapq.heappush(pq, (new_dist, neighbor.index, neighbor))
-                    
-                    VIZ_CACHE.weights[obj.name] = obj_weights
+        for obj in edit_objs:
+            bm = bms[obj]
+            mat = obj.matrix_world
+            sel_indices = tuple(v.index for v in bm.verts if v.select)
+            cache_key_elements.extend([
+                obj.name,
+                len(bm.verts),
+                len(bm.edges),
+                sel_indices,
+                tuple(mat.col[3]),
+                modifier_edit_display_signature(obj),
+            ])
 
-            else:
-                kd = kdtree.KDTree(len(global_centers))
-                for i, c in enumerate(global_centers):
-                    kd.insert(c, i)
-                kd.balance()
+        current_hash = hash(tuple(cache_key_elements))
 
-                for obj in edit_objs:
-                    bm = bms[obj]
-                    mat = obj.matrix_world
-                    cage = cage_coords_by_obj.get(obj)
-                    obj_weights = []
-                    for v in bm.verts:
-                        wp = vert_world_pos(mat, v, cage)
-                        _, _, dist = kd.find(wp)
-                        if dist <= rad:
+        coord_elements = []
+        for obj in edit_objs:
+            bm = bms[obj]
+            mat = obj.matrix_world
+            cage = cage_coords_by_obj.get(obj)
+            for v in bm.verts:
+                if v.select:
+                    wp = vert_world_pos(mat, v, cage)
+                    coord_elements.extend([round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)])
+        current_coord_hash = hash(tuple(coord_elements))
+
+        if current_coord_hash != VIZ_CACHE.coord_hash:
+            VIZ_CACHE.coord_hash = current_coord_hash
+            VIZ_CACHE.last_change_time = time.time()
+            VIZ_CACHE.is_dirty = True
+
+        rebuild = False
+
+        if current_hash != VIZ_CACHE.hash:
+            rebuild = True
+            VIZ_CACHE.hash = current_hash
+            VIZ_CACHE.is_dirty = False
+
+        elif VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
+            rebuild = True
+            VIZ_CACHE.is_dirty = False
+
+        if rebuild:
+            VIZ_CACHE.weights.clear()
+
+            global_centers = []
+            for obj in edit_objs:
+                bm = bms[obj]
+                mat = obj.matrix_world
+                cage = cage_coords_by_obj.get(obj)
+                sel = [v for v in bm.verts if v.select]
+                global_centers.extend([vert_world_pos(mat, v, cage) for v in sel])
+                VIZ_CACHE.weights[obj.name] = []
+
+            if global_centers:
+                if ts.use_proportional_connected:
+                    for obj in edit_objs:
+                        bm = bms[obj]
+                        mat = obj.matrix_world
+                        cage = cage_coords_by_obj.get(obj)
+                        sel = [v for v in bm.verts if v.select]
+                        if not sel: continue
+
+                        distances = {v: 0.0 for v in sel}
+                        pq = [(0.0, v.index, v) for v in sel]
+                        heapq.heapify(pq)
+
+                        obj_weights = []
+                        while pq:
+                            dist, _, v = heapq.heappop(pq)
+
+                            if dist > distances.get(v, float('inf')): continue
+
                             w = falloff(dist / rad, ts.proportional_edit_falloff)
                             if w > 0.0:
                                 obj_weights.append((v.index, w))
-                    
-                    VIZ_CACHE.weights[obj.name] = obj_weights
 
-    vert_weights = []
-    for obj in edit_objs:
-        if obj.name not in VIZ_CACHE.weights: continue
-        bm = bms[obj]
-        mat = obj.matrix_world
-        cage = cage_coords_by_obj.get(obj)
-        bm.verts.ensure_lookup_table() 
-        
-        for v_idx, w in VIZ_CACHE.weights[obj.name]:
-            try:
-                v = bm.verts[v_idx]
-                wp = vert_world_pos(mat, v, cage)
-                vert_weights.append((wp, w))
-            except IndexError:
-                pass
-    if not vert_weights: return
+                            for edge in v.link_edges:
+                                neighbor = edge.other_vert(v)
+                                p_v = vert_world_pos(mat, v, cage)
+                                p_n = vert_world_pos(mat, neighbor, cage)
+                                edge_len = (p_v - p_n).length
+                                new_dist = dist + edge_len
+
+                                if new_dist <= rad:
+                                    if new_dist < distances.get(neighbor, float('inf')):
+                                        distances[neighbor] = new_dist
+                                        heapq.heappush(pq, (new_dist, neighbor.index, neighbor))
+
+                        VIZ_CACHE.weights[obj.name] = obj_weights
+
+                else:
+                    kd = kdtree.KDTree(len(global_centers))
+                    for i, c in enumerate(global_centers):
+                        kd.insert(c, i)
+                    kd.balance()
+
+                    for obj in edit_objs:
+                        bm = bms[obj]
+                        mat = obj.matrix_world
+                        cage = cage_coords_by_obj.get(obj)
+                        obj_weights = []
+                        for v in bm.verts:
+                            wp = vert_world_pos(mat, v, cage)
+                            _, _, dist = kd.find(wp)
+                            if dist <= rad:
+                                w = falloff(dist / rad, ts.proportional_edit_falloff)
+                                if w > 0.0:
+                                    obj_weights.append((v.index, w))
+
+                        VIZ_CACHE.weights[obj.name] = obj_weights
+
+        vert_weights = []
+        for obj in edit_objs:
+            if obj.name not in VIZ_CACHE.weights: continue
+            bm = bms[obj]
+            mat = obj.matrix_world
+            cage = cage_coords_by_obj.get(obj)
+            bm.verts.ensure_lookup_table()
+
+            for v_idx, w in VIZ_CACHE.weights[obj.name]:
+                try:
+                    v = bm.verts[v_idx]
+                    wp = vert_world_pos(mat, v, cage)
+                    vert_weights.append((wp, w))
+                except IndexError:
+                    pass
+
+        if not vert_weights: return
 
     coords, colors, indices = [], [], []
     vc = 0
@@ -431,6 +462,15 @@ class SoftVizSettings(bpy.types.PropertyGroup):
     use_screen_space: bpy.props.BoolProperty(name="Constant Screen Size", default=False)
     dot_size: bpy.props.FloatProperty(default=5.0, min=0.01, max=100.0)
     alpha_fade: bpy.props.FloatProperty(default=0.5, min=0.0, max=1.0)
+    viz_mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('PROPORTIONAL', "Proportional", "Visualize proportional editing influence"),
+            ('VERTEX_GROUP', "Vertex Group", "Visualize vertex group weights"),
+        ],
+        default='PROPORTIONAL',
+    )
+    vgroup_name: bpy.props.StringProperty(name="Vertex Group", default="")
 
 # -------------------------------------------------
 # UI
@@ -484,6 +524,29 @@ class VIEW3D_PT_softviz_colors(bpy.types.Panel):
             l.template_color_ramp(ramp_node, "color_ramp", expand=True)
             l.operator("view3d.softviz_reset_ramp", icon='FILE_REFRESH')
 
+
+class VIEW3D_PT_softviz_vgroups(bpy.types.Panel):
+    bl_label = "Vertex Groups"
+    bl_idname = "VIEW3D_PT_softviz_vgroups"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'SoftViz'
+    bl_parent_id = "VIEW3D_PT_softviz"
+    bl_order = 2
+
+    def draw(self, context):
+        l = self.layout
+        s = context.scene.softviz_settings
+        obj = context.active_object
+
+        l.row().prop(s, "viz_mode", expand=True)
+
+        if s.viz_mode == 'VERTEX_GROUP':
+            if obj and obj.type == 'MESH' and obj.vertex_groups:
+                l.prop_search(s, "vgroup_name", obj, "vertex_groups", text="Group")
+            else:
+                l.label(text="No vertex groups found", icon='INFO')
+
 # -------------------------------------------------
 # REGISTER
 # -------------------------------------------------
@@ -494,6 +557,7 @@ classes = (
     VIEW3D_PT_softviz,
     VIEW3D_PT_softviz_display,
     VIEW3D_PT_softviz_colors,
+    VIEW3D_PT_softviz_vgroups,
 )
 
 def register():
