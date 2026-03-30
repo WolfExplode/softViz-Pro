@@ -233,6 +233,43 @@ def draw_callback():
 
         if not vert_weights: return
 
+    # ------- SHAPE KEY mode -------
+    elif s.viz_mode == 'SHAPE_KEY':
+        vert_weights = []
+        for obj in edit_objs:
+            mesh = obj.data
+            if not mesh.shape_keys or not mesh.shape_keys.key_blocks:
+                continue
+
+            sk = mesh.shape_keys.key_blocks.get(s.shape_key_name) if s.shape_key_name else None
+            if not sk:
+                idx = obj.active_shape_key_index
+                if 0 <= idx < len(mesh.shape_keys.key_blocks):
+                    sk = mesh.shape_keys.key_blocks[idx]
+            if not sk:
+                continue
+
+            basis = mesh.shape_keys.reference_key
+            displacements = [
+                (sk.data[i].co - basis.data[i].co).length
+                for i in range(len(mesh.vertices))
+            ]
+            max_d = max(displacements) if displacements else 0.0
+            if max_d < 1e-6:
+                continue
+
+            bm = bms[obj]
+            mat = obj.matrix_world
+            cage = cage_coords_by_obj.get(obj)
+            bm.verts.ensure_lookup_table()
+            for v in bm.verts:
+                d = displacements[v.index]
+                if d > 0.0:
+                    wp = vert_world_pos(mat, v, cage)
+                    vert_weights.append((wp, d / max_d))
+
+        if not vert_weights: return
+
     # ------- PROPORTIONAL mode -------
     else:
         rad = ts.proportional_size
@@ -467,10 +504,12 @@ class SoftVizSettings(bpy.types.PropertyGroup):
         items=[
             ('PROPORTIONAL', "Proportional", "Visualize proportional editing influence"),
             ('VERTEX_GROUP', "Vertex Group", "Visualize vertex group weights"),
+            ('SHAPE_KEY', "Shape Key", "Visualize shape key displacement per vertex"),
         ],
         default='PROPORTIONAL',
     )
     vgroup_name: bpy.props.StringProperty(name="Vertex Group", default="")
+    shape_key_name: bpy.props.StringProperty(name="Shape Key", default="")
 
 # -------------------------------------------------
 # UI
@@ -525,9 +564,9 @@ class VIEW3D_PT_softviz_colors(bpy.types.Panel):
             l.operator("view3d.softviz_reset_ramp", icon='FILE_REFRESH')
 
 
-class VIEW3D_PT_softviz_vgroups(bpy.types.Panel):
-    bl_label = "Vertex Groups"
-    bl_idname = "VIEW3D_PT_softviz_vgroups"
+class VIEW3D_PT_softviz_mode(bpy.types.Panel):
+    bl_label = "Mode"
+    bl_idname = "VIEW3D_PT_softviz_mode"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'SoftViz'
@@ -547,6 +586,12 @@ class VIEW3D_PT_softviz_vgroups(bpy.types.Panel):
             else:
                 l.label(text="No vertex groups found", icon='INFO')
 
+        elif s.viz_mode == 'SHAPE_KEY':
+            if obj and obj.type == 'MESH' and obj.data.shape_keys:
+                l.prop_search(s, "shape_key_name", obj.data.shape_keys, "key_blocks", text="Key")
+            else:
+                l.label(text="No shape keys found", icon='INFO')
+
 # -------------------------------------------------
 # REGISTER
 # -------------------------------------------------
@@ -557,7 +602,7 @@ classes = (
     VIEW3D_PT_softviz,
     VIEW3D_PT_softviz_display,
     VIEW3D_PT_softviz_colors,
-    VIEW3D_PT_softviz_vgroups,
+    VIEW3D_PT_softviz_mode,
 )
 
 def register():
