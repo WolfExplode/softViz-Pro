@@ -29,7 +29,8 @@ uniform mat4 u_view_mat;
 uniform vec3 u_right;
 uniform vec3 u_up;
 uniform float u_dot_size;
-uniform bool u_screen_space;
+uniform float u_ortho_half;
+uniform int u_screen_mode;
 
 in vec3 pos;
 in vec2 corner;
@@ -39,11 +40,13 @@ out vec4 frag_color;
 
 void main() {
     float factor;
-    if (u_screen_space) {
+    if (u_screen_mode == 0) {
+        factor = u_dot_size * 0.005;
+    } else if (u_screen_mode == 2) {
+        factor = u_ortho_half;
+    } else {
         float depth = max(0.01, -(u_view_mat * vec4(pos, 1.0)).z);
         factor = depth * u_dot_size * 0.0005;
-    } else {
-        factor = u_dot_size * 0.005;
     }
     vec3 world_pos = pos
         + u_right * (corner.x * factor)
@@ -66,15 +69,17 @@ void main() {
 # in GPUShaderCreateInfo — NOT as bare 'uniform' in GLSL source.
 # Two mat4s = 128 bytes exactly, so we replace the full view matrix with just
 # its Z row (vec4, 16 bytes) since that's all we need for depth.
-# Total push-constant budget: mat4(64) + vec4(16)*3 + float(4) + int(4) = 120 bytes.
+# Total push-constant budget: mat4(64) + vec4(16)*3 + float(4) + float(4) + int(4) = 124 bytes.
 _SOFTVIZ_VERT_NEW = """
 void main() {
     float factor;
-    if (u_screen_space != 0) {
+    if (u_screen_mode == 0) {
+        factor = u_dot_size * 0.005;
+    } else if (u_screen_mode == 2) {
+        factor = u_ortho_half;
+    } else {
         float depth = max(0.01, -dot(u_view_z_row, vec4(pos, 1.0)));
         factor = depth * u_dot_size * 0.0005;
-    } else {
-        factor = u_dot_size * 0.005;
     }
     vec3 world_pos = pos
         + u_right.xyz * (corner.x * factor)
@@ -108,7 +113,8 @@ def create_softviz_shader():
     info.push_constant("VEC4", "u_right")
     info.push_constant("VEC4", "u_up")
     info.push_constant("FLOAT", "u_dot_size")
-    info.push_constant("INT", "u_screen_space")
+    info.push_constant("FLOAT", "u_ortho_half")
+    info.push_constant("INT", "u_screen_mode")
     info.vertex_out(iface)
     info.fragment_out(0, "VEC4", "FragColor")
     info.vertex_source(_SOFTVIZ_VERT_NEW)
@@ -295,6 +301,13 @@ def vert_world_pos(mat, v, cage_coords):
         return cage_coords[v.index]
     return mat @ v.co
 
+def transform_modal_active(ctx):
+    ao = getattr(ctx, "active_operator", None)
+    if ao is None:
+        return False
+    bid = getattr(ao, "bl_idname", "") or ""
+    return bid.startswith("transform.")
+
 # -------------------------------------------------
 # DRAW
 # -------------------------------------------------
@@ -321,9 +334,10 @@ def draw_callback():
         bms[obj] = bmesh.from_edit_mesh(obj.data)
 
     depsgraph = ctx.evaluated_depsgraph_get()
+    live_tf = transform_modal_active(ctx)
     cage_coords_by_obj = {}
     for obj in edit_objs:
-        if object_uses_modifier_edit_display(obj):
+        if object_uses_modifier_edit_display(obj) or live_tf:
             c = eval_vert_world_coords(obj, depsgraph, len(obj.data.vertices))
             if c is not None:
                 cage_coords_by_obj[obj] = c
@@ -432,7 +446,12 @@ def draw_callback():
 
         rebuild = False
 
-        if current_hash != VIZ_CACHE.hash:
+        if live_tf:
+            # Modal G/R/S: viewport uses evaluated geometry; recalc every frame
+            # (debounce would leave weights frozen during the drag).
+            rebuild = True
+            VIZ_CACHE.is_dirty = False
+        elif current_hash != VIZ_CACHE.hash:
             rebuild = True
             VIZ_CACHE.hash = current_hash
             VIZ_CACHE.is_dirty = False
@@ -565,7 +584,11 @@ def draw_callback():
     else:
         data_hash = ('SK', s.shape_key_name, len(vert_weights))
 
-    batch_key = (data_hash, VIZ_CACHE.ramp_lut_key, round(s.alpha_fade, 4))
+    pos_fp = hash(tuple(
+        (round(wp.x, 3), round(wp.y, 3), round(wp.z, 3))
+        for wp, _ in vert_weights
+    ))
+    batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(s.alpha_fade, 4))
 
     if VIZ_CACHE.batch is None or VIZ_CACHE.batch_hash != batch_key:
         positions = []
@@ -611,6 +634,20 @@ def draw_callback():
     if VIZ_CACHE.batch is None:
         return
 
+    ortho_half = 0.0
+    if s.use_screen_space:
+        if rv3d.is_perspective:
+            screen_mode = 1
+        else:
+            # Same world-space factor as perspective (depth * dot * 0.0005 in the
+            # shader), using view_distance so size matches when toggling ortho — the
+            # old pixel-based ortho size was visually smaller than this tuned formula.
+            screen_mode = 2
+            depth_ref = max(0.01, float(rv3d.view_distance))
+            ortho_half = depth_ref * s.dot_size * 0.0005
+    else:
+        screen_mode = 0
+
     try:
         view_z_row = tuple(rv3d.view_matrix[2])
         gpu.state.blend_set('ALPHA')
@@ -621,7 +658,8 @@ def draw_callback():
         SHADER.uniform_float("u_right", (*right_base, 0.0))
         SHADER.uniform_float("u_up", (*up_base, 0.0))
         SHADER.uniform_float("u_dot_size", s.dot_size)
-        SHADER.uniform_int("u_screen_space", (1,) if s.use_screen_space else (0,))
+        SHADER.uniform_float("u_ortho_half", ortho_half)
+        SHADER.uniform_int("u_screen_mode", (screen_mode,))
         VIZ_CACHE.batch.draw(SHADER)
     except Exception as ex:
         if not VIZ_CACHE.draw_error_logged:
