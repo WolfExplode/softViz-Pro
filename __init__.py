@@ -1,4 +1,4 @@
-import bpy, bmesh, gpu, heapq, time
+import bpy, bmesh, gpu, heapq, time, traceback
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, kdtree
 
@@ -16,6 +16,105 @@ bl_info = {
 
 NG_NAME = "SoftViz_ColorRamp_NG"
 DRAW_HANDLE = None
+SHADER = None
+# Set True if gpu.types.GPUShader failed; cleared when heatmap is toggled off.
+SOFTVIZ_SHADER_FAILED = False
+
+_QUAD_CORNERS = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+
+# Legacy full GLSL (Blender < 5 still allows gpu.types.GPUShader(vertex, frag)).
+_SOFTVIZ_VERT_LEGACY = """
+uniform mat4 u_mvp;
+uniform mat4 u_view_mat;
+uniform vec3 u_right;
+uniform vec3 u_up;
+uniform float u_dot_size;
+uniform bool u_screen_space;
+
+in vec3 pos;
+in vec2 corner;
+in vec4 color;
+
+out vec4 frag_color;
+
+void main() {
+    float factor;
+    if (u_screen_space) {
+        float depth = max(0.01, -(u_view_mat * vec4(pos, 1.0)).z);
+        factor = depth * u_dot_size * 0.0005;
+    } else {
+        factor = u_dot_size * 0.005;
+    }
+    vec3 world_pos = pos
+        + u_right * (corner.x * factor)
+        + u_up    * (corner.y * factor);
+    gl_Position = u_mvp * vec4(world_pos, 1.0);
+    frag_color = color;
+}
+"""
+
+_SOFTVIZ_FRAG_LEGACY = """
+in vec4 frag_color;
+out vec4 FragColor;
+
+void main() {
+    FragColor = frag_color;
+}
+"""
+
+# Blender 5+ (Vulkan-compatible): uniforms must be declared via push_constant
+# in GPUShaderCreateInfo — NOT as bare 'uniform' in GLSL source.
+# Two mat4s = 128 bytes exactly, so we replace the full view matrix with just
+# its Z row (vec4, 16 bytes) since that's all we need for depth.
+# Total push-constant budget: mat4(64) + vec4(16)*3 + float(4) + int(4) = 120 bytes.
+_SOFTVIZ_VERT_NEW = """
+void main() {
+    float factor;
+    if (u_screen_space != 0) {
+        float depth = max(0.01, -dot(u_view_z_row, vec4(pos, 1.0)));
+        factor = depth * u_dot_size * 0.0005;
+    } else {
+        factor = u_dot_size * 0.005;
+    }
+    vec3 world_pos = pos
+        + u_right.xyz * (corner.x * factor)
+        + u_up.xyz    * (corner.y * factor);
+    gl_Position = u_mvp * vec4(world_pos, 1.0);
+    frag_color = color;
+}
+"""
+
+_SOFTVIZ_FRAG_NEW = """
+void main() {
+    FragColor = frag_color;
+}
+"""
+
+
+def create_softviz_shader():
+    create_fn = getattr(gpu.shader, "create_from_info", None)
+    if create_fn is None:
+        return gpu.types.GPUShader(_SOFTVIZ_VERT_LEGACY, _SOFTVIZ_FRAG_LEGACY)
+
+    iface = gpu.types.GPUStageInterfaceInfo("softviz_v2f")
+    iface.smooth("VEC4", "frag_color")
+
+    info = gpu.types.GPUShaderCreateInfo()
+    info.vertex_in(0, "VEC3", "pos")
+    info.vertex_in(1, "VEC2", "corner")
+    info.vertex_in(2, "VEC4", "color")
+    info.push_constant("MAT4", "u_mvp")
+    info.push_constant("VEC4", "u_view_z_row")
+    info.push_constant("VEC4", "u_right")
+    info.push_constant("VEC4", "u_up")
+    info.push_constant("FLOAT", "u_dot_size")
+    info.push_constant("INT", "u_screen_space")
+    info.vertex_out(iface)
+    info.fragment_out(0, "VEC4", "FragColor")
+    info.vertex_source(_SOFTVIZ_VERT_NEW)
+    info.fragment_source(_SOFTVIZ_FRAG_NEW)
+
+    return create_fn(info)
 
 # -------------------------------------------------
 # CACHE SYSTEM
@@ -26,7 +125,12 @@ class SoftVizCache:
         self.coord_hash = None
         self.last_change_time = 0
         self.is_dirty = False
-        self.weights = {} 
+        self.weights = {}
+        self.batch = None
+        self.batch_hash = None
+        self.ramp_lut = None
+        self.ramp_lut_key = None
+        self.draw_error_logged = False
 
 VIZ_CACHE = SoftVizCache()
 
@@ -34,13 +138,18 @@ VIZ_CACHE = SoftVizCache()
 # DRAW HANDLER SAFETY
 # -------------------------------------------------
 def remove_draw_handler():
-    global DRAW_HANDLE
+    global DRAW_HANDLE, SHADER, SOFTVIZ_SHADER_FAILED
     if DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(DRAW_HANDLE, 'WINDOW')
         except:
             pass
         DRAW_HANDLE = None
+    VIZ_CACHE.batch = None
+    VIZ_CACHE.batch_hash = None
+    VIZ_CACHE.draw_error_logged = False
+    SHADER = None
+    SOFTVIZ_SHADER_FAILED = False
 
 @bpy.app.handlers.persistent
 def softviz_load_post(dummy):
@@ -116,6 +225,16 @@ def get_ramp_node():
         if n.type == 'VALTORGB':
             return n
     return None
+
+def get_or_bake_lut(ramp_node):
+    if ramp_node is None:
+        return None
+    ramp = ramp_node.color_ramp
+    key = tuple((e.position, tuple(e.color)) for e in ramp.elements)
+    if key != VIZ_CACHE.ramp_lut_key:
+        VIZ_CACHE.ramp_lut = [tuple(ramp.evaluate(i / 255.0)) for i in range(256)]
+        VIZ_CACHE.ramp_lut_key = key
+    return VIZ_CACHE.ramp_lut
 
 # -------------------------------------------------
 # RESET RAMP
@@ -410,56 +529,105 @@ def draw_callback():
 
         if not vert_weights: return
 
-    coords, colors, indices = [], [], []
-    vc = 0
+    global SHADER, SOFTVIZ_SHADER_FAILED
+    if SHADER is None and not SOFTVIZ_SHADER_FAILED:
+        try:
+            SHADER = create_softviz_shader()
+        except Exception as ex:
+            SOFTVIZ_SHADER_FAILED = True
+            if not VIZ_CACHE.draw_error_logged:
+                print("SoftViz: GPUShader creation failed:", ex)
+                traceback.print_exc()
+                VIZ_CACHE.draw_error_logged = True
+            return
+
+    if SHADER is None:
+        return
 
     rv3d = ctx.region_data
     if not rv3d: return
-    
+
     view_mat = rv3d.view_matrix
     view_inv = view_mat.inverted().to_3x3()
     right_base = view_inv @ Vector((1, 0, 0))
     up_base = view_inv @ Vector((0, 1, 0))
 
-    for wp, w in vert_weights:
-        if s.use_screen_space:
-            if rv3d.is_perspective:
-                depth = max(0.01, -(view_mat @ wp).z) 
-                factor = depth * s.dot_size * 0.0005 
-            else:
-                factor = rv3d.view_distance * s.dot_size * 0.0005 
-        else:
-            factor = s.dot_size * 0.005 
+    lut = get_or_bake_lut(ramp_node)
 
-        right = right_base * factor
-        up = up_base * factor
-        
-        if ramp:
-            r, g, b, a = ramp.evaluate(w)
-        else:
-            r, g, b, a = (1, 0, 0, 1)
-
-        a = (a * (1 - s.alpha_fade)) + (w * s.alpha_fade)
-        col = (r, g, b, a)
-
-        coords += [wp - right - up, wp + right - up, wp + right + up, wp - right + up]
-        colors += [col] * 4
-        indices += [(vc, vc + 1, vc + 2), (vc, vc + 2, vc + 3)]
-        vc += 4
-
-    if not coords: return
-
-    sh = gpu.shader.from_builtin('SMOOTH_COLOR')
-    batch = batch_for_shader(sh, 'TRIS', {"pos": coords, "color": colors}, indices=indices)
-    gpu.state.blend_set('ALPHA')
-    
-    if s.use_xray:
-        gpu.state.depth_test_set('ALWAYS')
+    # Batch stores center positions + corner offsets + pre-baked colors.
+    # Camera orientation and dot_size are passed as uniforms every frame,
+    # so the batch only needs rebuilding when the underlying weights or
+    # colors change — not on every camera move or mode switch.
+    if s.viz_mode == 'PROPORTIONAL':
+        data_hash = VIZ_CACHE.hash
+    elif s.viz_mode == 'VERTEX_GROUP':
+        data_hash = ('VG', s.vgroup_name, len(vert_weights))
     else:
-        gpu.state.depth_test_set('LESS_EQUAL')
-        
-    sh.bind()
-    batch.draw(sh)
+        data_hash = ('SK', s.shape_key_name, len(vert_weights))
+
+    batch_key = (data_hash, VIZ_CACHE.ramp_lut_key, round(s.alpha_fade, 4))
+
+    if VIZ_CACHE.batch is None or VIZ_CACHE.batch_hash != batch_key:
+        positions = []
+        corner_list = []
+        color_list = []
+        indices = []
+        vc = 0
+        alpha_fade = s.alpha_fade
+
+        for wp, w in vert_weights:
+            if lut is not None:
+                r, g, b, a = lut[min(255, int(w * 255))]
+            else:
+                r, g, b, a = (1.0, 0.0, 0.0, 1.0)
+            a = (a * (1.0 - alpha_fade)) + (w * alpha_fade)
+            col = (r, g, b, a)
+
+            p = (wp.x, wp.y, wp.z)
+            positions.extend([p, p, p, p])
+            corner_list.extend(_QUAD_CORNERS)
+            color_list.extend([col, col, col, col])
+            indices.extend([(vc, vc + 1, vc + 2), (vc, vc + 2, vc + 3)])
+            vc += 4
+
+        if not positions: return
+
+        try:
+            VIZ_CACHE.batch = batch_for_shader(
+                SHADER, 'TRIS',
+                {"pos": positions, "corner": corner_list, "color": color_list},
+                indices=indices,
+            )
+            VIZ_CACHE.batch_hash = batch_key
+        except Exception as ex:
+            VIZ_CACHE.batch = None
+            VIZ_CACHE.batch_hash = None
+            if not VIZ_CACHE.draw_error_logged:
+                print("SoftViz: batch_for_shader failed:", ex)
+                traceback.print_exc()
+                VIZ_CACHE.draw_error_logged = True
+            return
+
+    if VIZ_CACHE.batch is None:
+        return
+
+    try:
+        view_z_row = tuple(rv3d.view_matrix[2])
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('ALWAYS' if s.use_xray else 'LESS_EQUAL')
+        SHADER.bind()
+        SHADER.uniform_float("u_mvp", rv3d.perspective_matrix)
+        SHADER.uniform_float("u_view_z_row", view_z_row)
+        SHADER.uniform_float("u_right", (*right_base, 0.0))
+        SHADER.uniform_float("u_up", (*up_base, 0.0))
+        SHADER.uniform_float("u_dot_size", s.dot_size)
+        SHADER.uniform_int("u_screen_space", (1,) if s.use_screen_space else (0,))
+        VIZ_CACHE.batch.draw(SHADER)
+    except Exception as ex:
+        if not VIZ_CACHE.draw_error_logged:
+            print("SoftViz: GPU draw/uniforms failed:", ex)
+            traceback.print_exc()
+            VIZ_CACHE.draw_error_logged = True
 
 # -------------------------------------------------
 # TOGGLE
