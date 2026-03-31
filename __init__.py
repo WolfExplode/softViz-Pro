@@ -868,7 +868,10 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
     def invoke(self, context, event):
         global _SV_MODAL_RADIUS, _SV_TRANSFORM_SNAPSHOT
         if not _softviz_spy_should_run(context):
-            return _TRANSFORM_OPS[self.transform_type]()
+            result = _TRANSFORM_OPS[self.transform_type]()
+            # Transform has already registered its own modal handler; spy must not
+            # return RUNNING_MODAL without modal_handler_add(self).
+            return {'CANCELLED'} if 'CANCELLED' in result else {'FINISHED'}
         snap = _capture_softviz_transform_snapshot(context)
         result = _TRANSFORM_OPS[self.transform_type]()
         # If nothing was selected / transform cancelled immediately, don't go modal.
