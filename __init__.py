@@ -25,7 +25,11 @@ _QUAD_CORNERS = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
 # Multiplier for view-facing dot offset (see vertex shaders: toward_viewer * factor * this).
 POINT_LIFT_FACTOR = 0.5
 # Edit mode draws mesh verts on top; use a larger lift so SoftViz dots stay readable.
-POINT_LIFT_FACTOR_EDIT = 2.5
+POINT_LIFT_FACTOR_EDIT = 3
+# Edit-mode lift scaling based on viewport distance to mesh bbox center.
+# Clamped so close-up doesn't look "detached", but far views avoid z-fighting.
+POINT_LIFT_EDIT_REF_DIST = 2.0
+POINT_LIFT_EDIT_MAX_SCALE = 8.0
 
 # Scroll-spy state - set/cleared by VIEW3D_OT_softviz_transform_spy
 _SV_MODAL_RADIUS = None
@@ -1022,10 +1026,36 @@ def draw_callback():
     else:
         screen_mode = 0
 
-    point_lift = (
-        float(POINT_LIFT_FACTOR_EDIT)
-        if ctx.mode == 'EDIT_MESH'
-        else float(POINT_LIFT_FACTOR))
+    point_lift = float(POINT_LIFT_FACTOR)
+    if ctx.mode == 'EDIT_MESH':
+        view_pos = rv3d.view_matrix.inverted().translation
+        dist = None
+        for obj in edit_objs:
+            try:
+                bb = obj.bound_box
+                if not bb:
+                    continue
+                center_local = Vector((0.0, 0.0, 0.0))
+                for c in bb:
+                    center_local += Vector(c)
+                center_local *= (1.0 / 8.0)
+                center_world = obj.matrix_world @ center_local
+                d = (view_pos - center_world).length
+                dist = d if dist is None else min(dist, d)
+            except Exception:
+                continue
+
+        if dist is None:
+            point_lift = float(POINT_LIFT_FACTOR_EDIT)
+        else:
+            ref = max(1e-6, float(POINT_LIFT_EDIT_REF_DIST))
+            scale = dist / ref
+            if scale < 1.0:
+                scale = 1.0
+            max_scale = float(POINT_LIFT_EDIT_MAX_SCALE)
+            if scale > max_scale:
+                scale = max_scale
+            point_lift = float(POINT_LIFT_FACTOR_EDIT) * scale
 
     try:
         view_z_row = tuple(rv3d.view_matrix[2])
