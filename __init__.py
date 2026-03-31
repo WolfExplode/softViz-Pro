@@ -33,12 +33,32 @@ POINT_LIFT_FACTOR_EDIT = 3
 POINT_LIFT_EDIT_REF_DIST = 2.0
 POINT_LIFT_EDIT_MAX_SCALE = 8.0
 
-# Scroll-spy state - set/cleared by VIEW3D_OT_softviz_transform_spy
-_SV_MODAL_RADIUS = None
-# obj_name -> list[Vector|None] indexed by mesh vertex index; world coords at transform start
-_SV_TRANSFORM_SNAPSHOT = None
-_SV_MODAL_KD = None
-_SV_KEYMAPS = []
+# Rebuild / redraw debounce when selection or coords change (seconds).
+CACHE_DEBOUNCE_SEC = 0.2
+# Transform spy scroll: estimated proportional radius *= or /= this per notch.
+PROPORTIONAL_SCROLL_FACTOR = 1.1
+# Quantize world coords for stable cache/batch fingerprints (see draw_callback).
+COORD_HASH_QUANT = 1000.0
+WEIGHT_HASH_QUANT = 1_000_000.0
+# Shape-key flatness, point-lift distance ratio floor, etc.
+FLOAT_LEN_MIN = 1e-6
+# Mirror symmetry duplicate collapse (world units).
+MIRROR_POS_EPSILON = 1e-4
+
+
+class SoftVizRuntime:
+    """Modal spy and keymap state in one place (avoids scattered _SV_* globals)."""
+
+    __slots__ = ("modal_radius", "transform_snapshot", "modal_kd", "spy_keymaps")
+
+    def __init__(self):
+        self.modal_radius = None
+        self.transform_snapshot = None
+        self.modal_kd = None
+        self.spy_keymaps = []
+
+
+RT = SoftVizRuntime()
 # Transform spy: print start/end/scroll radius to the system console.
 debug = False
 
@@ -172,6 +192,7 @@ class SoftVizCache:
         # during cage/deform evaluation.
         self._evaluating_cage = False
         self.cage_cache_sig = None
+        # Object.name -> world-space cage coords per vert index (not bpy.types.Object keys).
         self.cage_coords_by_obj_cache = {}
         self.edit_vw_list = None
         self.edit_vw_sig = None
@@ -204,8 +225,9 @@ def remove_draw_handler():
     if DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(DRAW_HANDLE, 'WINDOW')
-        except Exception:
-            pass
+        except Exception as e:
+            if debug:
+                print("SoftViz: draw_handler_remove failed:", e)
         DRAW_HANDLE = None
     VIZ_CACHE.batch = None
     VIZ_CACHE.batch_hash = None
@@ -246,7 +268,7 @@ def softviz_load_post(dummy):
 @bpy.app.handlers.persistent
 def softviz_depsgraph_update_post(scene, depsgraph):
     # Cage evaluation temporarily toggles modifier visibility; don't let that invalidate caches.
-    if getattr(VIZ_CACHE, "_evaluating_cage", False):
+    if VIZ_CACHE._evaluating_cage:
         return
     scenes = _bpy_scenes()
     if not scenes or not any(s.softviz_running for s in scenes):
@@ -257,12 +279,12 @@ def softviz_depsgraph_update_post(scene, depsgraph):
             VIZ_CACHE.mesh_eval_dirty = True
             return
         if isinstance(id_, bpy.types.Object) and id_.type == 'MESH':
-            if getattr(update, 'is_updated_geometry', False) or getattr(update, 'is_updated_transform', False):
+            if update.is_updated_geometry or update.is_updated_transform:
                 VIZ_CACHE.mesh_eval_dirty = True
                 return
             ctx = bpy.context
-            oim = getattr(ctx, 'objects_in_mode', None)
-            if oim and id_ in oim and getattr(ctx, 'mode', None) == 'EDIT_MESH':
+            oim = ctx.objects_in_mode
+            if oim and id_ in oim and ctx.mode == 'EDIT_MESH':
                 # Selection, overlays, etc. (not always tagged as geometry)
                 VIZ_CACHE.mesh_eval_dirty = True
                 return
@@ -273,7 +295,7 @@ def softviz_depsgraph_update_post(scene, depsgraph):
 def softviz_cache_timer():
     scene = bpy.context.scene
     if scene.softviz_running:
-        if VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
+        if VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > CACHE_DEBOUNCE_SEC:
             for window in bpy.context.window_manager.windows:
                 for area in window.screen.areas:
                     if area.type == 'VIEW_3D':
@@ -430,7 +452,7 @@ def topology_edit_display_warning_lines(context):
                 lines.append(f"{obj.name}: {mod.name} ({mod.type})")
     return lines
 
-def proportional_mirror_world_positions(obj, mat, wp, epsilon=1e-4):
+def proportional_mirror_world_positions(obj, mat, wp, epsilon=MIRROR_POS_EPSILON):
     """World positions mirrored in object-local space per mesh symmetry flags."""
     if not (obj.use_mesh_mirror_x or obj.use_mesh_mirror_y or obj.use_mesh_mirror_z):
         return (wp.copy(),)
@@ -458,6 +480,8 @@ def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
     try:
         me = eval_obj.to_mesh()
     except Exception:
+        if debug:
+            traceback.print_exc()
         return None
     try:
         if len(me.vertices) != expected_vert_count:
@@ -469,7 +493,6 @@ def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
 
 def eval_vert_world_coords_for_draw_cage(obj, ctx, expected_vert_count):
     restored = []
-    prev_guard = VIZ_CACHE._evaluating_cage
     VIZ_CACHE._evaluating_cage = True
     try:
         for mod in obj.modifiers:
@@ -488,7 +511,7 @@ def eval_vert_world_coords_for_draw_cage(obj, ctx, expected_vert_count):
             mod.show_viewport = prev
         if restored:
             ctx.view_layer.update()
-        VIZ_CACHE._evaluating_cage = prev_guard
+        VIZ_CACHE._evaluating_cage = False
 
 def vert_world_pos(mat, v, cage_coords):
     if cage_coords is not None and v.index < len(cage_coords):
@@ -556,8 +579,7 @@ def _softviz_edit_vg_sk_cache_signature(settings, edit_objs):
 
 def _softviz_proportional_cache_key_elements(ts, edit_objs, bm_by_obj, sel_by_name=None):
     """Match draw order for cache_key_elements. bm_by_obj set = use live bmesh; else sel_by_name + mesh counts."""
-    global _SV_MODAL_RADIUS
-    rad = _SV_MODAL_RADIUS if _SV_MODAL_RADIUS is not None else ts.proportional_size
+    rad = RT.modal_radius if RT.modal_radius is not None else ts.proportional_size
     cache_key_elements = [
         rad,
         ts.proportional_edit_falloff,
@@ -606,13 +628,13 @@ def _capture_softviz_transform_snapshot(context):
             c = eval_vert_world_coords_for_draw_cage(
                 obj, context, len(obj.data.vertices))
             if c is not None:
-                cage_coords_by_obj[obj] = c
+                cage_coords_by_obj[obj.name] = c
     snap = {}
     for obj in edit_objs:
         bm = bmesh.from_edit_mesh(obj.data)
         mw = obj.matrix_world.copy()
         mw_inv = mw.inverted()
-        cage = cage_coords_by_obj.get(obj)
+        cage = cage_coords_by_obj.get(obj.name)
         n = len(obj.data.vertices)
         # Flat array of local coords (x,y,z)*n; NaN means "unset".
         coords = array.array('f', [float('nan')]) * (n * 3)
@@ -630,23 +652,21 @@ def _capture_softviz_transform_snapshot(context):
 
 def _snap_vert_world(snapshot, obj, vert_index, mat, v, cage):
     """World pos for weight math during modal: snapshot if valid, else live cage pos."""
-    if snapshot:
-        row = snapshot.get(obj.name)
-        if row:
-            n = row.get("n", 0)
-            if 0 <= vert_index < n:
-                coords = row.get("coords")
-                i = vert_index * 3
-                if coords is not None and (i + 2) < len(coords):
-                    x = coords[i]
-                    # NaN check: NaN != NaN
-                    if x == x:
-                        mw = row.get("mw")
-                        if mw is not None:
-                            y = coords[i + 1]
-                            z = coords[i + 2]
-                            return mw @ Vector((x, y, z))
-    return vert_world_pos(mat, v, cage)
+    if not snapshot:
+        return vert_world_pos(mat, v, cage)
+    row = snapshot.get(obj.name)
+    if not row:
+        return vert_world_pos(mat, v, cage)
+    n = row["n"]
+    if not (0 <= vert_index < n):
+        return vert_world_pos(mat, v, cage)
+    coords = row["coords"]
+    i = vert_index * 3
+    x = coords[i]
+    # NaN means "unset" in snapshot (see _capture_softviz_transform_snapshot).
+    if x != x:
+        return vert_world_pos(mat, v, cage)
+    return row["mw"] @ Vector((x, coords[i + 1], coords[i + 2]))
 
 # -------------------------------------------------
 # DRAW
@@ -697,7 +717,7 @@ def draw_callback():
                 c = eval_vert_world_coords_for_draw_cage(
                     obj, ctx, len(obj.data.vertices))
                 if c is not None:
-                    VIZ_CACHE.cage_coords_by_obj_cache[obj] = c
+                    VIZ_CACHE.cage_coords_by_obj_cache[obj.name] = c
         VIZ_CACHE.cage_cache_sig = cage_sig
     cage_coords_by_obj = VIZ_CACHE.cage_coords_by_obj_cache
 
@@ -712,7 +732,7 @@ def draw_callback():
             and s.viz_mode == 'PROPORTIONAL'
             and ctx.mode == 'EDIT_MESH'):
         if (not mesh_changed
-                and _SV_MODAL_RADIUS is None
+                and RT.modal_radius is None
                 and not VIZ_CACHE.is_dirty
                 and VIZ_CACHE.hash is not None
                 and VIZ_CACHE.vert_weights is not None
@@ -736,7 +756,7 @@ def draw_callback():
             vert_weights = []
             for obj in edit_objs:
                 mat = obj.matrix_world
-                cage = cage_coords_by_obj.get(obj)
+                cage = cage_coords_by_obj.get(obj.name)
                 mesh = obj.data
 
                 vg = obj.vertex_groups.get(s.vgroup_name) if s.vgroup_name else None
@@ -810,11 +830,11 @@ def draw_callback():
                         for i in range(len(mesh.vertices))
                     ]
                 max_d = max(displacements) if displacements else 0.0
-                if max_d < 1e-6:
+                if max_d < FLOAT_LEN_MIN:
                     continue
 
                 mat = obj.matrix_world
-                cage = cage_coords_by_obj.get(obj)
+                cage = cage_coords_by_obj.get(obj.name)
                 if bm is not None:
                     bm.verts.ensure_lookup_table()
                     for v in bm.verts:
@@ -835,7 +855,7 @@ def draw_callback():
         else:
             # During a live transform, use the spy-tracked estimate if available;
             # ts.proportional_size is stale inside the modal until the operator exits.
-            rad = _SV_MODAL_RADIUS if (_SV_MODAL_RADIUS is not None) else ts.proportional_size
+            rad = RT.modal_radius if (RT.modal_radius is not None) else ts.proportional_size
 
             cache_key_elements = _softviz_proportional_cache_key_elements(
                 ts, edit_objs, bms, None)
@@ -849,15 +869,15 @@ def draw_callback():
             for obj in edit_objs:
                 bm = bms[obj]
                 mat = obj.matrix_world
-                cage = cage_coords_by_obj.get(obj)
+                cage = cage_coords_by_obj.get(obj.name)
                 for v in bm.verts:
                     if v.select:
                         wp = vert_world_pos(mat, v, cage)
                         _softviz_digest_i32_triplet(
                             h_coords,
-                            round(wp.x * 1000.0),
-                            round(wp.y * 1000.0),
-                            round(wp.z * 1000.0),
+                            round(wp.x * COORD_HASH_QUANT),
+                            round(wp.y * COORD_HASH_QUANT),
+                            round(wp.z * COORD_HASH_QUANT),
                         )
             current_coord_hash = h_coords.digest()
 
@@ -868,7 +888,7 @@ def draw_callback():
 
             rebuild = False
 
-            if _SV_MODAL_RADIUS is not None:
+            if RT.modal_radius is not None:
                 # Spy-keyed G/R/S session: recalc every frame while dragging/scrolling.
                 rebuild = True
                 VIZ_CACHE.is_dirty = False
@@ -877,19 +897,19 @@ def draw_callback():
                 VIZ_CACHE.hash = current_hash
                 VIZ_CACHE.is_dirty = False
 
-            elif VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
+            elif VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > CACHE_DEBOUNCE_SEC:
                 rebuild = True
                 VIZ_CACHE.is_dirty = False
 
             if rebuild:
                 VIZ_CACHE.weights.clear()
-                snap = _SV_TRANSFORM_SNAPSHOT
+                snap = RT.transform_snapshot
 
                 global_centers = []
                 for obj in edit_objs:
                     bm = bms[obj]
                     mat = obj.matrix_world
-                    cage = cage_coords_by_obj.get(obj)
+                    cage = cage_coords_by_obj.get(obj.name)
                     sel = [v for v in bm.verts if v.select]
                     for v in sel:
                         global_centers.append(
@@ -901,7 +921,7 @@ def draw_callback():
                         for obj in edit_objs:
                             bm = bms[obj]
                             mat = obj.matrix_world
-                            cage = cage_coords_by_obj.get(obj)
+                            cage = cage_coords_by_obj.get(obj.name)
                             sel = [v for v in bm.verts if v.select]
                             if not sel: continue
 
@@ -919,9 +939,9 @@ def draw_callback():
                                 if w > 0.0:
                                     obj_weights.append((v.index, w))
 
+                                p_v = _snap_vert_world(snap, obj, v.index, mat, v, cage)
                                 for edge in v.link_edges:
                                     neighbor = edge.other_vert(v)
-                                    p_v = _snap_vert_world(snap, obj, v.index, mat, v, cage)
                                     p_n = _snap_vert_world(
                                         snap, obj, neighbor.index, mat, neighbor, cage)
                                     edge_len = (p_v - p_n).length
@@ -935,22 +955,21 @@ def draw_callback():
                             VIZ_CACHE.weights[obj.name] = obj_weights
 
                     else:
-                        global _SV_MODAL_KD
                         kd = None
-                        if _SV_MODAL_RADIUS is not None and _SV_MODAL_KD is not None:
-                            kd = _SV_MODAL_KD
+                        if RT.modal_radius is not None and RT.modal_kd is not None:
+                            kd = RT.modal_kd
                         else:
                             kd = kdtree.KDTree(len(global_centers))
                             for i, c in enumerate(global_centers):
                                 kd.insert(c, i)
                             kd.balance()
-                            if _SV_MODAL_RADIUS is not None:
-                                _SV_MODAL_KD = kd
+                            if RT.modal_radius is not None:
+                                RT.modal_kd = kd
 
                         for obj in edit_objs:
                             bm = bms[obj]
                             mat = obj.matrix_world
-                            cage = cage_coords_by_obj.get(obj)
+                            cage = cage_coords_by_obj.get(obj.name)
                             obj_weights = []
                             for v in bm.verts:
                                 wp = _snap_vert_world(snap, obj, v.index, mat, v, cage)
@@ -968,7 +987,7 @@ def draw_callback():
                     if obj.name not in VIZ_CACHE.weights: continue
                     bm = bms[obj]
                     mat = obj.matrix_world
-                    cage = cage_coords_by_obj.get(obj)
+                    cage = cage_coords_by_obj.get(obj.name)
                     bm.verts.ensure_lookup_table()
                     for v_idx, w in VIZ_CACHE.weights[obj.name]:
                         try:
@@ -1025,32 +1044,24 @@ def draw_callback():
         for wp, w in vert_weights:
             _softviz_digest_i32_quad(
                 h_pos,
-                round(wp.x * 1000.0),
-                round(wp.y * 1000.0),
-                round(wp.z * 1000.0),
-                round(w * 1000000.0),
-            )
-        pos_fp = h_pos.digest()
-    elif s.viz_mode == 'VERTEX_GROUP':
-        data_hash = ('VG', s.vgroup_name, len(vert_weights))
-        h_pos = _softviz_blake2b16()
-        for wp, _ in vert_weights:
-            _softviz_digest_i32_triplet(
-                h_pos,
-                round(wp.x * 1000.0),
-                round(wp.y * 1000.0),
-                round(wp.z * 1000.0),
+                round(wp.x * COORD_HASH_QUANT),
+                round(wp.y * COORD_HASH_QUANT),
+                round(wp.z * COORD_HASH_QUANT),
+                round(w * WEIGHT_HASH_QUANT),
             )
         pos_fp = h_pos.digest()
     else:
-        data_hash = ('SK', s.shape_key_name, len(vert_weights))
+        if s.viz_mode == 'VERTEX_GROUP':
+            data_hash = ('VG', s.vgroup_name, len(vert_weights))
+        else:
+            data_hash = ('SK', s.shape_key_name, len(vert_weights))
         h_pos = _softviz_blake2b16()
         for wp, _ in vert_weights:
             _softviz_digest_i32_triplet(
                 h_pos,
-                round(wp.x * 1000.0),
-                round(wp.y * 1000.0),
-                round(wp.z * 1000.0),
+                round(wp.x * COORD_HASH_QUANT),
+                round(wp.y * COORD_HASH_QUANT),
+                round(wp.z * COORD_HASH_QUANT),
             )
         pos_fp = h_pos.digest()
     batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(s.alpha_fade, 4))
@@ -1118,24 +1129,23 @@ def draw_callback():
         view_pos = rv3d.view_matrix.inverted().translation
         dist = None
         for obj in edit_objs:
-            try:
-                bb = obj.bound_box
-                if not bb:
-                    continue
-                center_local = Vector((0.0, 0.0, 0.0))
-                for c in bb:
-                    center_local += Vector(c)
-                center_local *= (1.0 / 8.0)
-                center_world = obj.matrix_world @ center_local
-                d = (view_pos - center_world).length
-                dist = d if dist is None else min(dist, d)
-            except Exception:
+            bb = obj.bound_box
+            # Object.bound_box: API uses (-1,-1,-1) for all coords when unavailable.
+            c0 = bb[0]
+            if c0[0] == -1.0 and c0[1] == -1.0 and c0[2] == -1.0:
                 continue
+            center_local = Vector((0.0, 0.0, 0.0))
+            for c in bb:
+                center_local += Vector(c)
+            center_local *= (1.0 / 8.0)
+            center_world = obj.matrix_world @ center_local
+            d = (view_pos - center_world).length
+            dist = d if dist is None else min(dist, d)
 
         if dist is None:
             point_lift = float(POINT_LIFT_FACTOR_EDIT)
         else:
-            ref = max(1e-6, float(POINT_LIFT_EDIT_REF_DIST))
+            ref = max(FLOAT_LEN_MIN, float(POINT_LIFT_EDIT_REF_DIST))
             scale = dist / ref
             if scale < 1.0:
                 scale = 1.0
@@ -1209,38 +1219,35 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
     )
 
     def invoke(self, context, event):
-        global _SV_MODAL_RADIUS, _SV_TRANSFORM_SNAPSHOT, _SV_MODAL_KD
         if not _softviz_spy_should_run(context):
             result = _TRANSFORM_OPS[self.transform_type]()
             # Transform has already registered its own modal handler; spy must not
             # return RUNNING_MODAL without modal_handler_add(self).
             return {'CANCELLED'} if 'CANCELLED' in result else {'FINISHED'}
         snap = _capture_softviz_transform_snapshot(context)
-        _SV_MODAL_KD = None
+        RT.modal_kd = None
         result = _TRANSFORM_OPS[self.transform_type]()
         # If nothing was selected / transform cancelled immediately, don't go modal.
         if 'RUNNING_MODAL' not in result and 'FINISHED' not in result:
             return {'CANCELLED'}
-        _SV_TRANSFORM_SNAPSHOT = snap
-        _SV_MODAL_RADIUS = context.scene.tool_settings.proportional_size
+        RT.transform_snapshot = snap
+        RT.modal_radius = context.scene.tool_settings.proportional_size
         self._ending = False
         if debug:
-            print(f"[SoftVizSpy] transform started  | initial radius = {_SV_MODAL_RADIUS:.4f}")
+            print(f"[SoftVizSpy] transform started  | initial radius = {RT.modal_radius:.4f}")
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        global _SV_MODAL_RADIUS, _SV_TRANSFORM_SNAPSHOT, _SV_MODAL_KD
-
         # Previous event was a confirm/cancel - transform has now exited and
         # ts.proportional_size reflects the committed value.
         if self._ending:
             final = context.scene.tool_settings.proportional_size
             if debug:
                 print(f"[SoftVizSpy] transform ended    | final radius   = {final:.4f}")
-            _SV_MODAL_RADIUS = None
-            _SV_TRANSFORM_SNAPSHOT = None
-            _SV_MODAL_KD = None
+            RT.modal_radius = None
+            RT.transform_snapshot = None
+            RT.modal_kd = None
             return {'FINISHED'}
 
         # Detect confirm / cancel events; let transform consume them too.
@@ -1249,15 +1256,15 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
             self._ending = True
             return {'PASS_THROUGH'}
 
-        if event.type == 'WHEELUPMOUSE' and _SV_MODAL_RADIUS is not None:
-            _SV_MODAL_RADIUS /= 1.1
+        if event.type == 'WHEELUPMOUSE' and RT.modal_radius is not None:
+            RT.modal_radius /= PROPORTIONAL_SCROLL_FACTOR
             if debug:
-                print(f"[SoftVizSpy] SCROLL UP          | est. radius    = {_SV_MODAL_RADIUS:.4f}")
+                print(f"[SoftVizSpy] SCROLL UP          | est. radius    = {RT.modal_radius:.4f}")
 
-        elif event.type == 'WHEELDOWNMOUSE' and _SV_MODAL_RADIUS is not None:
-            _SV_MODAL_RADIUS *= 1.1
+        elif event.type == 'WHEELDOWNMOUSE' and RT.modal_radius is not None:
+            RT.modal_radius *= PROPORTIONAL_SCROLL_FACTOR
             if debug:
-                print(f"[SoftVizSpy] SCROLL DOWN        | est. radius    = {_SV_MODAL_RADIUS:.4f}")
+                print(f"[SoftVizSpy] SCROLL DOWN        | est. radius    = {RT.modal_radius:.4f}")
 
         return {'PASS_THROUGH'}
 
@@ -1434,12 +1441,12 @@ def register_spy_keymaps():
             any=False, shift=False, ctrl=False, alt=False,
         )
         kmi.properties.transform_type = ttype
-        _SV_KEYMAPS.append((km, kmi))
+        RT.spy_keymaps.append((km, kmi))
 
 def unregister_spy_keymaps():
-    for km, kmi in _SV_KEYMAPS:
+    for km, kmi in RT.spy_keymaps:
         km.keymap_items.remove(kmi)
-    _SV_KEYMAPS.clear()
+    RT.spy_keymaps.clear()
 
 def register():
     for c in classes:
