@@ -162,6 +162,9 @@ class SoftVizCache:
         self.draw_error_logged = False
         # Skip expensive cage / edit-mode vert_weight rebuilds until depsgraph says mesh changed.
         self.mesh_eval_dirty = True
+        # Guard to prevent depsgraph handler invalidation when we temporarily toggle modifiers
+        # during cage/deform evaluation.
+        self._evaluating_cage = False
         self.cage_cache_sig = None
         self.cage_coords_by_obj_cache = {}
         self.edit_vw_list = None
@@ -224,6 +227,9 @@ def softviz_load_post(dummy):
 
 @bpy.app.handlers.persistent
 def softviz_depsgraph_update_post(scene, depsgraph):
+    # Cage evaluation temporarily toggles modifier visibility; don't let that invalidate caches.
+    if getattr(VIZ_CACHE, "_evaluating_cage", False):
+        return
     scenes = _bpy_scenes()
     if not scenes or not any(s.softviz_running for s in scenes):
         return
@@ -445,18 +451,26 @@ def eval_vert_world_coords(obj, depsgraph, expected_vert_count):
 
 def eval_vert_world_coords_for_draw_cage(obj, ctx, expected_vert_count):
     restored = []
+    prev_guard = VIZ_CACHE._evaluating_cage
+    VIZ_CACHE._evaluating_cage = True
     try:
         for mod in obj.modifiers:
-            if mod.show_viewport and mod.show_in_editmode and mod.type in _TOPOLOGY_EDITDISPLAY_MODS:
-                restored.append((mod, mod.show_in_editmode))
-                mod.show_in_editmode = False
+            # Temporarily disable topology-changing modifiers (e.g. SubD) so the depsgraph
+            # evaluation returns cage/deform coords with stable vertex count.
+            # Use show_viewport so it works consistently in Object and Edit modes.
+            if mod.show_viewport and mod.type in _TOPOLOGY_EDITDISPLAY_MODS:
+                restored.append((mod, mod.show_viewport))
+                mod.show_viewport = False
         if restored:
             ctx.view_layer.update()
         depsgraph = ctx.evaluated_depsgraph_get()
         return eval_vert_world_coords(obj, depsgraph, expected_vert_count)
     finally:
         for mod, prev in restored:
-            mod.show_in_editmode = prev
+            mod.show_viewport = prev
+        if restored:
+            ctx.view_layer.update()
+        VIZ_CACHE._evaluating_cage = prev_guard
 
 def vert_world_pos(mat, v, cage_coords):
     if cage_coords is not None and v.index < len(cage_coords):
