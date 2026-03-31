@@ -1,68 +1,91 @@
-# Documentation for developer's thoughts
+# Developer documentation
 
-We cannot know the current proportional radius during transform. Blender doesn't expose it until the modal operator updates its internal state, which happens on mouse move or confirm, not scroll. So any fix that depends on reading ts.proportional_size during transform will be broken by design.
+## Proportional radius during transform (API)
 
-In blender, we can set Proportional editing radius to a specific value after we invoke a transform operator G/R/S. This means we can solve our Scroll Wheel Sync limitation by reading the current 
+We cannot know the current proportional radius during transform from RNA alone. Blender doesn't expose it until the modal operator updates its internal state (often on mouse move or confirm, not scroll). Any approach that only reads `ts.proportional_size` during the modal is unreliable.
+
+**Mitigation in this add-on:** a keymap-triggered operator with `MODAL_PRIORITY` runs alongside G/R/S, sees wheel events (with `PASS_THROUGH` to the transform), tracks an estimated radius, and snapshots mesh world positions at transform start so fall distances match Blender’s proportional field while verts move.
 
 ```python
-# Get the tool settings BEFORE the transform starts
+# Starting radius is accurate before the transform modal owns the event loop
 ts = bpy.context.scene.tool_settings
-last_known_radius = ts.proportional_size  # This is accurate here
-
-# Now invoke the transform (this enters modal state)
+last_known_radius = ts.proportional_size
 bpy.ops.transform.translate('INVOKE_DEFAULT')
 ```
 
-What you can do:
-Know the starting radius at transform begin
-Know the final radius after transform confirm (via ts.proportional_size again, or the Redo panel)
-Infer that if the user scrolled, the final != initial
+Older idea: infer scroll from final vs initial radius after confirm — still valid as a cross-check.
 
-if we scroll wheel or pageup/down we can record and set `bpy.context.scene.tool_settings.proportional_size = x.xx` depending on if we scroll up or down. 
-then after we commit the transform, we can read from the real radius and update the heatmap to match.
+### Event order and `MODAL_PRIORITY`
 
+It was once assumed Python could not see scroll during transform because modals consume events in stack order. **Blender 4.2+** adds `MODAL_PRIORITY` so an operator can handle events before other modals if it returns `PASS_THROUGH` for events the transform should still receive.
 
+Reference: [Modal operators (4.2 Python API)](https://developer.blender.org/docs/release_notes/4.2/python_api/#modal-operators)
 
-
-
-Is it possible to detect that scroll events occurred while Blender's modal operator is running? Blender's event handling passes events through modal operators in LIFO order, so the transform modal consumes scroll events before my operator would even see them. 
-
-do some research to figure out if what we are trying to do is even possible. 
-**No, you cannot reliably detect scroll events while Blender's transform modal is running without either:**
-- **Consuming the event** (blocking the transform operator), or
-- **Using C-level access** (not available in Python API)
-- The Python API only exposes the **RNA layer**, not the **internal modal state**
-- The event system is **LIFO (Last-In-First-Out)**, once the transform modal is active, it consumes events before any Python handler could see them
-- The **live radius value** exists only in C memory (`t->prop_size`), not in RNA (`ts->proportional_size`)
-
-
-
-There's a blender addon, screencast keys. when I do a transform operator, it can read keyboard inputs. how is this possible?
-does transform operator only consume specifically the scroll wheel and not other keyboard keys?
-
-in Blender 4.2+
 ```python
 class MyEventSpyOperator(bpy.types.Operator):
     bl_idname = "my.event_spy"
     bl_label = "Event Spy"
-    bl_options = {'MODAL_PRIORITY'}  # Handle events BEFORE transform!
-    
+    bl_options = {'MODAL_PRIORITY'}
+
     def modal(self, context, event):
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
-            print(f"Scroll detected! {event.type}")
-            # You can read it, but if you return 'RUNNING_MODAL', 
-            # you BLOCK the transform operator
-            
-        return {'PASS_THROUGH'}  # Let transform have it too
-    
+            ...
+        return {'PASS_THROUGH'}
+
     def invoke(self, context, event):
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 ```
-With [MODAL_PRIORITY](https://developer.blender.org/docs/release_notes/4.2/python_api/#modal-operators), your operator gets events before the transform operator . You can detect the scroll event, but you must return PASS_THROUGH if you want the transform operator to also receive it. 
 
-so this will allow us to read that a scroll up or down input has been sent and update our internal assumption of what the radius might be. 
+### Spy / operator return values
 
+When the spy does not attach its own modal (`_softviz_spy_should_run` is false), `invoke` must not return `{'RUNNING_MODAL'}` without `modal_handler_add(self)` — it runs the transform and returns `{'FINISHED'}` (or `{'CANCELLED'}`) so only the transform owns the modal stack.
 
-# Documentation for end user thoughts
-nothing right now...
+### `bpy.data` during register
+
+During add-on `register()`, `bpy.data` may be `_RestrictData` with no `.scenes`; use `getattr(bpy.data, "scenes", None)` where needed (see `_bpy_scenes()`).
+
+---
+
+## Technical overview (implementation)
+
+### Distance modes
+
+- **Connected Only off:** Euclidean distance in 3D via a KD-tree from seed points (selected verts at transform start when the spy snapshot is active; otherwise live positions).
+- **Connected Only on:** Dijkstra-style propagation along edges, using edge lengths from snapshot or live world positions as appropriate.
+
+### GPU drawing
+
+Influence points are drawn with `gpu` / `batch_for_shader` so the overlay stays usable on denser meshes.
+
+### Depth (X-Ray)
+
+Matches `draw_callback`: `gpu.state.depth_test_set('LESS_EQUAL')` when **X-Ray (Show Through)** is off (dots respect surface depth); when on, **`ALWAYS`** so depth tests always pass and dots draw through the mesh like the UI label suggests.
+
+### Dot sizing
+
+- **World space:** dot scale follows scene units / zoom.
+- **Screen space:** size tied to depth / ortho distance for more stable pixel width.
+
+### Caching
+
+Weights are rebuilt when inputs change; during an active spy session, proportional weights rebuild every draw frame so motion and scroll stay current.
+
+---
+
+## Transform + scroll sync (current behavior)
+
+- **Scroll radius:** `MODAL_PRIORITY` spy adjusts an internal `_SV_MODAL_RADIUS` and uses it in `draw_callback` while RNA may be stale.
+- **Falloff vs large drags:** `_SV_TRANSFORM_SNAPSHOT` stores per-vertex world positions at G/R/S start; weight math uses the snapshot during the spy session so the field does not “travel” incorrectly with dragged verts.
+- **Spy gating:** runs only when the heatmap is on, panel mode is **Proportional**, and Blender **proportional editing** is enabled (`_softviz_spy_should_run`).
+- **Keymap:** the spy is registered on addon **Mesh** keymap items for **G**, **R**, and **S** (unmodified). Starting move/rotate/scale only from the toolbar or menus does **not** run the spy — scroll/snapshot sync applies to keyboard shortcuts handled by that keymap.
+
+---
+
+## Modifier “Display in Edit Mode” (limitations)
+
+- SoftViz aligns with **evaluated** vertex positions when a supported **deform** modifier has viewport visibility and **Display in Edit Mode** enabled (e.g. Armature), matching the edit cage for those cases.
+- **Subdivision**, **Multires**, and other topology-changing modifiers are not supported for cage alignment: the Python API does not give a stable mapping from cage verts back to original mesh indices. If only those show in edit mode, the overlay uses base mesh positions.
+- If both deform and topology-changing modifiers show in edit mode, the add-on temporarily clears **Display in Edit Mode** on known topology-changing types only while sampling evaluation, then restores settings so deform-only evaluation still matches where possible.
+- The viewport may still show subdiv handles; dots follow the evaluated mesh used after that suppression, not necessarily the subdiv cage wire.
+
