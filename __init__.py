@@ -22,6 +22,10 @@ SOFTVIZ_SHADER_FAILED = False
 
 _QUAD_CORNERS = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
 
+# Scroll-spy state — set/cleared by VIEW3D_OT_softviz_transform_spy
+_SV_MODAL_RADIUS = None
+_SV_KEYMAPS = []
+
 # Legacy full GLSL (Blender < 5 still allows gpu.types.GPUShader(vertex, frag)).
 _SOFTVIZ_VERT_LEGACY = """
 uniform mat4 u_mvp;
@@ -69,17 +73,19 @@ void main() {
 # in GPUShaderCreateInfo — NOT as bare 'uniform' in GLSL source.
 # Two mat4s = 128 bytes exactly, so we replace the full view matrix with just
 # its Z row (vec4, 16 bytes) since that's all we need for depth.
-# Total push-constant budget: mat4(64) + vec4(16)*3 + float(4) + float(4) + int(4) = 124 bytes.
+# Pack dot_size, ortho_half, and screen_mode into u_params.xyz so total stays
+# at 128 bytes (64 + 16*4); some backends reject >128-byte push-constant blocks.
 _SOFTVIZ_VERT_NEW = """
 void main() {
+    int mode = int(u_params.z + 0.5);
     float factor;
-    if (u_screen_mode == 0) {
-        factor = u_dot_size * 0.005;
-    } else if (u_screen_mode == 2) {
-        factor = u_ortho_half;
+    if (mode == 0) {
+        factor = u_params.x * 0.005;
+    } else if (mode == 2) {
+        factor = u_params.y;
     } else {
         float depth = max(0.01, -dot(u_view_z_row, vec4(pos, 1.0)));
-        factor = depth * u_dot_size * 0.0005;
+        factor = depth * u_params.x * 0.0005;
     }
     vec3 world_pos = pos
         + u_right.xyz * (corner.x * factor)
@@ -112,9 +118,7 @@ def create_softviz_shader():
     info.push_constant("VEC4", "u_view_z_row")
     info.push_constant("VEC4", "u_right")
     info.push_constant("VEC4", "u_up")
-    info.push_constant("FLOAT", "u_dot_size")
-    info.push_constant("FLOAT", "u_ortho_half")
-    info.push_constant("INT", "u_screen_mode")
+    info.push_constant("VEC4", "u_params")
     info.vertex_out(iface)
     info.fragment_out(0, "VEC4", "FragColor")
     info.vertex_source(_SOFTVIZ_VERT_NEW)
@@ -143,12 +147,16 @@ VIZ_CACHE = SoftVizCache()
 # -------------------------------------------------
 # DRAW HANDLER SAFETY
 # -------------------------------------------------
+def _bpy_scenes():
+    """bpy.data can be _RestrictData during add-on register — no .scenes until file is available."""
+    return getattr(bpy.data, "scenes", None)
+
 def remove_draw_handler():
     global DRAW_HANDLE, SHADER, SOFTVIZ_SHADER_FAILED
     if DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(DRAW_HANDLE, 'WINDOW')
-        except:
+        except Exception:
             pass
         DRAW_HANDLE = None
     VIZ_CACHE.batch = None
@@ -160,7 +168,8 @@ def remove_draw_handler():
 def sync_softviz_draw_handler():
     """Match POST_VIEW draw handler to scene softviz_running (handlers are not saved in .blend)."""
     global DRAW_HANDLE
-    any_on = any(getattr(s, "softviz_running", False) for s in bpy.data.scenes)
+    scenes = _bpy_scenes()
+    any_on = any(s.softviz_running for s in scenes) if scenes is not None else False
     remove_draw_handler()
     if not any_on:
         return
@@ -170,9 +179,11 @@ def sync_softviz_draw_handler():
 
 @bpy.app.handlers.persistent
 def softviz_load_post(dummy):
-    for scene in bpy.data.scenes:
-        # Force native Connected Only to default to OFF on load
-        scene.tool_settings.use_proportional_connected = False
+    scenes = _bpy_scenes()
+    if scenes is not None:
+        for scene in scenes:
+            # Force native Connected Only to default to OFF on load
+            scene.tool_settings.use_proportional_connected = False
 
     sync_softviz_draw_handler()
     if not bpy.app.timers.is_registered(init_nodegroup_timer):
@@ -183,7 +194,7 @@ def softviz_load_post(dummy):
 # -------------------------------------------------
 def softviz_cache_timer():
     scene = bpy.context.scene
-    if getattr(scene, 'softviz_running', False):
+    if scene.softviz_running:
         if VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
             for window in bpy.context.window_manager.windows:
                 for area in window.screen.areas:
@@ -196,6 +207,8 @@ def softviz_cache_timer():
 # -------------------------------------------------
 def init_nodegroup_timer():
     ensure_nodegroup()
+    # register() can run with restricted bpy.data; resync draw handler once open.
+    sync_softviz_draw_handler()
     return None 
 
 def build_default_ramp(r):
@@ -317,7 +330,7 @@ def modifier_edit_display_signature(obj):
 
 def object_needs_evaluated_deform_cage(obj, shape_key_visualization=False):
     if obj.type == 'MESH' and obj.data.shape_keys:
-        if getattr(obj, "use_shape_key_edit_mode", False):
+        if obj.use_shape_key_edit_mode:
             return True
         # Edit-mode bmesh is the basis cage; viewport shows evaluated shape keys.
         if shape_key_visualization:
@@ -341,15 +354,13 @@ def topology_edit_display_warning_lines(context):
 
 def proportional_mirror_world_positions(obj, mat, wp, epsilon=1e-4):
     """World positions mirrored in object-local space per mesh symmetry flags."""
-    if not (getattr(obj, "use_mesh_mirror_x", False)
-            or getattr(obj, "use_mesh_mirror_y", False)
-            or getattr(obj, "use_mesh_mirror_z", False)):
+    if not (obj.use_mesh_mirror_x or obj.use_mesh_mirror_y or obj.use_mesh_mirror_z):
         return (wp.copy(),)
     inv = mat.inverted()
     local = inv @ wp
-    opts_x = (-1.0, 1.0) if getattr(obj, "use_mesh_mirror_x", False) else (1.0,)
-    opts_y = (-1.0, 1.0) if getattr(obj, "use_mesh_mirror_y", False) else (1.0,)
-    opts_z = (-1.0, 1.0) if getattr(obj, "use_mesh_mirror_z", False) else (1.0,)
+    opts_x = (-1.0, 1.0) if obj.use_mesh_mirror_x else (1.0,)
+    opts_y = (-1.0, 1.0) if obj.use_mesh_mirror_y else (1.0,)
+    opts_z = (-1.0, 1.0) if obj.use_mesh_mirror_z else (1.0,)
     out = []
     for sx in opts_x:
         for sy in opts_y:
@@ -398,19 +409,12 @@ def vert_world_pos(mat, v, cage_coords):
         return cage_coords[v.index]
     return mat @ v.co
 
-def transform_modal_active(ctx):
-    ao = getattr(ctx, "active_operator", None)
-    if ao is None:
-        return False
-    bid = getattr(ao, "bl_idname", "") or ""
-    return bid.startswith("transform.")
-
 # -------------------------------------------------
 # DRAW
 # -------------------------------------------------
 def draw_callback():
     ctx = bpy.context
-    if not getattr(ctx.scene, "softviz_running", False):
+    if not ctx.scene.softviz_running:
         return
     ts = ctx.tool_settings
     s = ctx.scene.softviz_settings
@@ -432,7 +436,6 @@ def draw_callback():
     for obj in edit_objs:
         bms[obj] = bmesh.from_edit_mesh(obj.data)
 
-    live_tf = transform_modal_active(ctx)
     cage_coords_by_obj = {}
     sk_viz = s.viz_mode == 'SHAPE_KEY'
     for obj in edit_objs:
@@ -486,7 +489,7 @@ def draw_callback():
             bm = bms[obj]
             bm.verts.ensure_lookup_table()
             # In shape key edit mode, bm.verts[i].co is the live edited position.
-            in_sk_edit = getattr(obj, "use_shape_key_edit_mode", False) and sk is not basis
+            in_sk_edit = obj.use_shape_key_edit_mode and sk is not basis
             if in_sk_edit:
                 displacements = [
                     (bm.verts[i].co - basis.data[i].co).length
@@ -513,10 +516,12 @@ def draw_callback():
 
     # ------- PROPORTIONAL mode -------
     else:
-        rad = ts.proportional_size
+        # During a live transform, use the spy-tracked estimate if available;
+        # ts.proportional_size is stale inside the modal until the operator exits.
+        rad = _SV_MODAL_RADIUS if (_SV_MODAL_RADIUS is not None) else ts.proportional_size
 
         cache_key_elements = [
-            ts.proportional_size,
+            rad,
             ts.proportional_edit_falloff,
             ts.use_proportional_connected,
         ]
@@ -532,10 +537,10 @@ def draw_callback():
                 sel_indices,
                 tuple(mat.col[3]),
                 modifier_edit_display_signature(obj),
-                getattr(obj, "use_shape_key_edit_mode", False),
-                getattr(obj, "use_mesh_mirror_x", False),
-                getattr(obj, "use_mesh_mirror_y", False),
-                getattr(obj, "use_mesh_mirror_z", False),
+                obj.use_shape_key_edit_mode,
+                obj.use_mesh_mirror_x,
+                obj.use_mesh_mirror_y,
+                obj.use_mesh_mirror_z,
             ])
 
         current_hash = hash(tuple(cache_key_elements))
@@ -558,9 +563,8 @@ def draw_callback():
 
         rebuild = False
 
-        if live_tf:
-            # Modal G/R/S: viewport uses evaluated geometry; recalc every frame
-            # (debounce would leave weights frozen during the drag).
+        if _SV_MODAL_RADIUS is not None:
+            # Spy-keyed G/R/S session: recalc every frame while dragging/scrolling.
             rebuild = True
             VIZ_CACHE.is_dirty = False
         elif current_hash != VIZ_CACHE.hash:
@@ -770,15 +774,91 @@ def draw_callback():
         SHADER.uniform_float("u_view_z_row", view_z_row)
         SHADER.uniform_float("u_right", (*right_base, 0.0))
         SHADER.uniform_float("u_up", (*up_base, 0.0))
-        SHADER.uniform_float("u_dot_size", s.dot_size)
-        SHADER.uniform_float("u_ortho_half", ortho_half)
-        SHADER.uniform_int("u_screen_mode", (screen_mode,))
+        SHADER.uniform_float(
+            "u_params",
+            (float(s.dot_size), float(ortho_half), float(screen_mode), 0.0),
+        )
         VIZ_CACHE.batch.draw(SHADER)
     except Exception as ex:
         if not VIZ_CACHE.draw_error_logged:
             print("SoftViz: GPU draw/uniforms failed:", ex)
             traceback.print_exc()
             VIZ_CACHE.draw_error_logged = True
+
+# -------------------------------------------------
+# TRANSFORM SPY (scroll-wheel radius tracker)
+# -------------------------------------------------
+_TRANSFORM_OPS = {
+    'TRANSLATE': lambda: bpy.ops.transform.translate('INVOKE_DEFAULT'),
+    'ROTATE':    lambda: bpy.ops.transform.rotate('INVOKE_DEFAULT'),
+    'RESIZE':    lambda: bpy.ops.transform.resize('INVOKE_DEFAULT'),
+}
+
+def _softviz_spy_should_run(context):
+    """Spy only when heatmap is on and we're visualizing proportional influence (same as draw_callback)."""
+    if not context.scene.softviz_running:
+        return False
+    if context.scene.softviz_settings.viz_mode != 'PROPORTIONAL':
+        return False
+    if not context.tool_settings.use_proportional_edit:
+        return False
+    return True
+
+class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
+    """Intercepts G/R/S to track scroll-wheel radius changes during modal transform."""
+    bl_idname = "view3d.softviz_transform_spy"
+    bl_label = "SoftViz Transform Spy"
+    bl_options = {'MODAL_PRIORITY'}
+
+    transform_type: bpy.props.EnumProperty(
+        items=[
+            ('TRANSLATE', "Translate", ""),
+            ('ROTATE',    "Rotate",    ""),
+            ('RESIZE',    "Scale",     ""),
+        ],
+        default='TRANSLATE',
+    )
+
+    def invoke(self, context, event):
+        global _SV_MODAL_RADIUS
+        if not _softviz_spy_should_run(context):
+            return _TRANSFORM_OPS[self.transform_type]()
+        result = _TRANSFORM_OPS[self.transform_type]()
+        # If nothing was selected / transform cancelled immediately, don't go modal.
+        if 'RUNNING_MODAL' not in result and 'FINISHED' not in result:
+            return {'CANCELLED'}
+        _SV_MODAL_RADIUS = context.scene.tool_settings.proportional_size
+        self._ending = False
+        print(f"[SoftVizSpy] transform started  | initial radius = {_SV_MODAL_RADIUS:.4f}")
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        global _SV_MODAL_RADIUS
+
+        # Previous event was a confirm/cancel — transform has now exited and
+        # ts.proportional_size reflects the committed value.
+        if self._ending:
+            final = context.scene.tool_settings.proportional_size
+            print(f"[SoftVizSpy] transform ended    | final radius   = {final:.4f}")
+            _SV_MODAL_RADIUS = None
+            return {'FINISHED'}
+
+        # Detect confirm / cancel events; let transform consume them too.
+        if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER',
+                          'RIGHTMOUSE', 'ESC'} and event.value in {'PRESS', 'CLICK'}:
+            self._ending = True
+            return {'PASS_THROUGH'}
+
+        if event.type == 'WHEELUPMOUSE' and _SV_MODAL_RADIUS is not None:
+            _SV_MODAL_RADIUS /= 1.1
+            print(f"[SoftVizSpy] SCROLL UP          | est. radius    = {_SV_MODAL_RADIUS:.4f}")
+
+        elif event.type == 'WHEELDOWNMOUSE' and _SV_MODAL_RADIUS is not None:
+            _SV_MODAL_RADIUS *= 1.1
+            print(f"[SoftVizSpy] SCROLL DOWN        | est. radius    = {_SV_MODAL_RADIUS:.4f}")
+
+        return {'PASS_THROUGH'}
 
 # -------------------------------------------------
 # TOGGLE
@@ -931,6 +1011,7 @@ class VIEW3D_PT_softviz_mode(bpy.types.Panel):
 # -------------------------------------------------
 classes = (
     SoftVizSettings,
+    VIEW3D_OT_softviz_transform_spy,
     VIEW3D_OT_softviz_toggle,
     VIEW3D_OT_softviz_reset_ramp,
     VIEW3D_PT_softviz,
@@ -938,6 +1019,25 @@ classes = (
     VIEW3D_PT_softviz_colors,
     VIEW3D_PT_softviz_mode,
 )
+
+def register_spy_keymaps():
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+    if kc is None:
+        return
+    km = kc.keymaps.new(name='Mesh', space_type='EMPTY')
+    for key, ttype in (('G', 'TRANSLATE'), ('R', 'ROTATE'), ('S', 'RESIZE')):
+        kmi = km.keymap_items.new(
+            'view3d.softviz_transform_spy', key, 'PRESS',
+            any=False, shift=False, ctrl=False, alt=False,
+        )
+        kmi.properties.transform_type = ttype
+        _SV_KEYMAPS.append((km, kmi))
+
+def unregister_spy_keymaps():
+    for km, kmi in _SV_KEYMAPS:
+        km.keymap_items.remove(kmi)
+    _SV_KEYMAPS.clear()
 
 def register():
     for c in classes:
@@ -955,12 +1055,16 @@ def register():
         bpy.app.timers.register(softviz_cache_timer)
 
     sync_softviz_draw_handler()
+    register_spy_keymaps()
 
 def unregister():
+    unregister_spy_keymaps()
     remove_draw_handler()
 
-    for scene in bpy.data.scenes:
-        scene.softviz_running = False
+    scenes = _bpy_scenes()
+    if scenes is not None:
+        for scene in scenes:
+            scene.softviz_running = False
 
     if softviz_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(softviz_load_post)
