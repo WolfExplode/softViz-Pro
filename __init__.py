@@ -22,6 +22,11 @@ SOFTVIZ_SHADER_FAILED = False
 
 _QUAD_CORNERS = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
 
+# Multiplier for view-facing dot offset (see vertex shaders: toward_viewer * factor * this).
+POINT_LIFT_FACTOR = 0.5
+# Edit mode draws mesh verts on top; use a larger lift so SoftViz dots stay readable.
+POINT_LIFT_FACTOR_EDIT = 2.5
+
 # Scroll-spy state - set/cleared by VIEW3D_OT_softviz_transform_spy
 _SV_MODAL_RADIUS = None
 # obj_name -> list[Vector|None] indexed by mesh vertex index; world coords at transform start
@@ -39,6 +44,7 @@ uniform vec3 u_up;
 uniform float u_dot_size;
 uniform float u_ortho_half;
 uniform int u_screen_mode;
+uniform float u_point_lift;
 
 in vec3 pos;
 in vec2 corner;
@@ -56,7 +62,9 @@ void main() {
         float depth = max(0.01, -(u_view_mat * vec4(pos, 1.0)).z);
         factor = depth * u_dot_size * 0.0005;
     }
-    vec3 world_pos = pos
+    vec3 toward_viewer = normalize(cross(u_right, u_up));
+    vec3 center = pos + toward_viewer * factor * u_point_lift;
+    vec3 world_pos = center
         + u_right * (corner.x * factor)
         + u_up    * (corner.y * factor);
     gl_Position = u_mvp * vec4(world_pos, 1.0);
@@ -91,7 +99,9 @@ void main() {
         float depth = max(0.01, -dot(u_view_z_row, vec4(pos, 1.0)));
         factor = depth * u_params.x * 0.0005;
     }
-    vec3 world_pos = pos
+    vec3 toward_viewer = normalize(cross(u_right.xyz, u_up.xyz));
+    vec3 center = pos + toward_viewer * factor * u_params.w;
+    vec3 world_pos = center
         + u_right.xyz * (corner.x * factor)
         + u_up.xyz    * (corner.y * factor);
     gl_Position = u_mvp * vec4(world_pos, 1.0);
@@ -1012,6 +1022,11 @@ def draw_callback():
     else:
         screen_mode = 0
 
+    point_lift = (
+        float(POINT_LIFT_FACTOR_EDIT)
+        if ctx.mode == 'EDIT_MESH'
+        else float(POINT_LIFT_FACTOR))
+
     try:
         view_z_row = tuple(rv3d.view_matrix[2])
         gpu.state.blend_set('ALPHA')
@@ -1023,8 +1038,11 @@ def draw_callback():
         SHADER.uniform_float("u_up", (*up_base, 0.0))
         SHADER.uniform_float(
             "u_params",
-            (float(s.dot_size), float(ortho_half), float(screen_mode), 0.0),
+            (float(s.dot_size), float(ortho_half), float(screen_mode),
+             point_lift),
         )
+        if getattr(gpu.shader, "create_from_info", None) is None:
+            SHADER.uniform_float("u_point_lift", point_lift)
         VIZ_CACHE.batch.draw(SHADER)
     except Exception as ex:
         if not VIZ_CACHE.draw_error_logged:
