@@ -22,7 +22,7 @@ SOFTVIZ_SHADER_FAILED = False
 
 _QUAD_CORNERS = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
 
-# Scroll-spy state — set/cleared by VIEW3D_OT_softviz_transform_spy
+# Scroll-spy state - set/cleared by VIEW3D_OT_softviz_transform_spy
 _SV_MODAL_RADIUS = None
 # obj_name -> list[Vector|None] indexed by mesh vertex index; world coords at transform start
 _SV_TRANSFORM_SNAPSHOT = None
@@ -74,7 +74,7 @@ void main() {
 """
 
 # Blender 5+ (Vulkan-compatible): uniforms must be declared via push_constant
-# in GPUShaderCreateInfo — NOT as bare 'uniform' in GLSL source.
+# in GPUShaderCreateInfo - NOT as bare 'uniform' in GLSL source.
 # Two mat4s = 128 bytes exactly, so we replace the full view matrix with just
 # its Z row (vec4, 16 bytes) since that's all we need for depth.
 # Pack dot_size, ortho_half, and screen_mode into u_params.xyz so total stays
@@ -146,6 +146,12 @@ class SoftVizCache:
         self.ramp_lut = None
         self.ramp_lut_key = None
         self.draw_error_logged = False
+        # Skip expensive cage / edit-mode vert_weight rebuilds until depsgraph says mesh changed.
+        self.mesh_eval_dirty = True
+        self.cage_cache_sig = None
+        self.cage_coords_by_obj_cache = {}
+        self.edit_vw_list = None
+        self.edit_vw_sig = None
 
 VIZ_CACHE = SoftVizCache()
 
@@ -153,7 +159,7 @@ VIZ_CACHE = SoftVizCache()
 # DRAW HANDLER SAFETY
 # -------------------------------------------------
 def _bpy_scenes():
-    """bpy.data can be _RestrictData during add-on register — no .scenes until file is available."""
+    """bpy.data can be _RestrictData during add-on register - no .scenes until file is available."""
     return getattr(bpy.data, "scenes", None)
 
 def remove_draw_handler():
@@ -167,6 +173,10 @@ def remove_draw_handler():
     VIZ_CACHE.batch = None
     VIZ_CACHE.batch_hash = None
     VIZ_CACHE.vert_weights = None
+    VIZ_CACHE.cage_cache_sig = None
+    VIZ_CACHE.cage_coords_by_obj_cache = {}
+    VIZ_CACHE.edit_vw_list = None
+    VIZ_CACHE.edit_vw_sig = None
     VIZ_CACHE.draw_error_logged = False
     SHADER = None
     SOFTVIZ_SHADER_FAILED = False
@@ -194,6 +204,21 @@ def softviz_load_post(dummy):
     sync_softviz_draw_handler()
     if not bpy.app.timers.is_registered(init_nodegroup_timer):
         bpy.app.timers.register(init_nodegroup_timer, first_interval=0.1)
+
+@bpy.app.handlers.persistent
+def softviz_depsgraph_update_post(scene, depsgraph):
+    scenes = _bpy_scenes()
+    if not scenes or not any(s.softviz_running for s in scenes):
+        return
+    for update in depsgraph.updates:
+        id_ = update.id
+        if isinstance(id_, bpy.types.Mesh):
+            VIZ_CACHE.mesh_eval_dirty = True
+            return
+        if isinstance(id_, bpy.types.Object) and id_.type == 'MESH':
+            if getattr(update, 'is_updated_geometry', False) or getattr(update, 'is_updated_transform', False):
+                VIZ_CACHE.mesh_eval_dirty = True
+                return
 
 # -------------------------------------------------
 # DEBOUNCE TIMER
@@ -309,7 +334,7 @@ def falloff(d, mode):
 # -------------------------------------------------
 # MODIFIER CAGE / EVALUATED MESH (align with edit-mode display)
 # -------------------------------------------------
-# Deform modifiers that keep a 1:1 mapping to mesh verts — safe to read from
+# Deform modifiers that keep a 1:1 mapping to mesh verts - safe to read from
 # evaluated mesh positions. Subdivision / Multires / etc. are NOT listed here
 # so enabling "Display in Edit Mode" on them alone does not turn on cage eval
 # (Blender Python cannot match cage verts to original indices).
@@ -319,9 +344,9 @@ _DEFORM_MODIFIER_EDIT_TYPES = frozenset({
     'CORRECTIVE_SMOOTH', 'SURFACE_DEFORM', 'WARP', 'WAVE',
 })
 
-# Modifiers that usually change vert count when stacked — temporarily turn off
+# Modifiers that usually change vert count when stacked - temporarily turn off
 # "show in edit mode" only while sampling evaluated coords so Armature etc.
-# still resolve (API evaluates full stack; without this, count mismatch → no cage).
+# still resolve (API evaluates full stack; without this, count mismatch -> no cage).
 _TOPOLOGY_EDITDISPLAY_MODS = frozenset({
     'SUBSURF', 'MULTIRES', 'MIRROR', 'ARRAY', 'BOOLEAN', 'BUILD',
     'DECIMATE', 'REMESH', 'NODES', 'WELD', 'WIREFRAME', 'SKIN',
@@ -415,8 +440,67 @@ def vert_world_pos(mat, v, cage_coords):
         return cage_coords[v.index]
     return mat @ v.co
 
+def _softviz_matrix_fingerprint(mw):
+    return tuple(round(mw[i][j], 5) for i in range(4) for j in range(4))
+
+def _softviz_cage_cache_signature(edit_objs, sk_viz):
+    parts = []
+    for obj in edit_objs:
+        if not object_needs_evaluated_deform_cage(obj, shape_key_visualization=sk_viz):
+            continue
+        parts.append((
+            obj.name,
+            len(obj.data.vertices),
+            modifier_edit_display_signature(obj),
+            sk_viz,
+            obj.use_shape_key_edit_mode,
+        ))
+    return tuple(parts)
+
+def _softviz_resolve_shape_key_object(mesh, settings, obj):
+    if not mesh.shape_keys or not mesh.shape_keys.key_blocks:
+        return None
+    sk = mesh.shape_keys.key_blocks.get(settings.shape_key_name) if settings.shape_key_name else None
+    if not sk:
+        idx = obj.active_shape_key_index
+        if 0 <= idx < len(mesh.shape_keys.key_blocks):
+            sk = mesh.shape_keys.key_blocks[idx]
+    return sk
+
+def _softviz_edit_vg_sk_cache_signature(settings, edit_objs):
+    sk_viz = settings.viz_mode == 'SHAPE_KEY'
+    sig = [
+        settings.viz_mode,
+        settings.vgroup_name,
+        settings.shape_key_name,
+        _softviz_cage_cache_signature(edit_objs, sk_viz),
+    ]
+    for obj in edit_objs:
+        sig.append(obj.name)
+        sig.append(_softviz_matrix_fingerprint(obj.matrix_world))
+        sig.append(modifier_edit_display_signature(obj))
+        sig.append(obj.use_shape_key_edit_mode)
+        sig.append(obj.use_mesh_mirror_x)
+        sig.append(obj.use_mesh_mirror_y)
+        sig.append(obj.use_mesh_mirror_z)
+        if settings.viz_mode == 'VERTEX_GROUP':
+            vg = obj.vertex_groups.get(settings.vgroup_name) if settings.vgroup_name else None
+            if not vg:
+                vg = obj.vertex_groups.active
+            sig.append(vg.name if vg else '')
+            sig.append(vg.index if vg else -1)
+        elif settings.viz_mode == 'SHAPE_KEY':
+            sk = _softviz_resolve_shape_key_object(obj.data, settings, obj)
+            if sk:
+                sig.append(sk.name)
+                sig.append(round(sk.value, 6))
+            else:
+                sig.append(None)
+                sig.append(0.0)
+    return tuple(sig)
+
 def _capture_softviz_transform_snapshot(context):
-    """World position per vertex index at G/R/S start — matches Blender proportional falloff basis."""
+    """World position per vertex index at G/R/S start - matches Blender proportional falloff basis."""
     edit_objs = [o for o in context.objects_in_mode if o.type == 'MESH']
     if not edit_objs:
         return {}
@@ -482,279 +566,306 @@ def draw_callback():
     ramp_node = get_ramp_node()
     ramp = ramp_node.color_ramp if ramp_node else None
 
-    bms = {}
+    mesh_changed = VIZ_CACHE.mesh_eval_dirty
+    VIZ_CACHE.mesh_eval_dirty = False
+
     if s.viz_mode == 'PROPORTIONAL':
-        for obj in edit_objs:
-            bms[obj] = bmesh.from_edit_mesh(obj.data)
-    elif ctx.mode == 'EDIT_MESH' and s.viz_mode in ('SHAPE_KEY', 'VERTEX_GROUP'):
-        for obj in edit_objs:
-            bms[obj] = bmesh.from_edit_mesh(obj.data)
+        VIZ_CACHE.edit_vw_list = None
+        VIZ_CACHE.edit_vw_sig = None
 
-    cage_coords_by_obj = {}
+    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY') and ctx.mode != 'EDIT_MESH':
+        VIZ_CACHE.edit_vw_list = None
+        VIZ_CACHE.edit_vw_sig = None
+
     sk_viz = s.viz_mode == 'SHAPE_KEY'
-    for obj in edit_objs:
-        if object_needs_evaluated_deform_cage(obj, shape_key_visualization=sk_viz):
-            c = eval_vert_world_coords_for_draw_cage(
-                obj, ctx, len(obj.data.vertices))
-            if c is not None:
-                cage_coords_by_obj[obj] = c
-
-    # ------- VERTEX GROUP mode -------
-    if s.viz_mode == 'VERTEX_GROUP':
-        vert_weights = []
+    cage_sig = _softviz_cage_cache_signature(edit_objs, sk_viz)
+    if mesh_changed or VIZ_CACHE.cage_cache_sig != cage_sig:
+        VIZ_CACHE.cage_coords_by_obj_cache = {}
         for obj in edit_objs:
-            mat = obj.matrix_world
-            cage = cage_coords_by_obj.get(obj)
-            mesh = obj.data
+            if object_needs_evaluated_deform_cage(obj, shape_key_visualization=sk_viz):
+                c = eval_vert_world_coords_for_draw_cage(
+                    obj, ctx, len(obj.data.vertices))
+                if c is not None:
+                    VIZ_CACHE.cage_coords_by_obj_cache[obj] = c
+        VIZ_CACHE.cage_cache_sig = cage_sig
+    cage_coords_by_obj = VIZ_CACHE.cage_coords_by_obj_cache
 
-            vg = obj.vertex_groups.get(s.vgroup_name) if s.vgroup_name else None
-            if not vg:
-                vg = obj.vertex_groups.active
-            if not vg:
-                continue
+    vert_weights = None
+    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY') and ctx.mode == 'EDIT_MESH':
+        cand_sig = _softviz_edit_vg_sk_cache_signature(s, edit_objs)
+        if (not mesh_changed and VIZ_CACHE.edit_vw_sig == cand_sig
+                and VIZ_CACHE.edit_vw_list is not None):
+            vert_weights = VIZ_CACHE.edit_vw_list
 
-            bm = bms.get(obj)
-            if bm is not None:
-                dvert_layer = bm.verts.layers.deform.verify()
-                vg_idx = vg.index
-                for v in bm.verts:
-                    w = v[dvert_layer].get(vg_idx, 0.0)
-                    if w > 0.0:
-                        wp = vert_world_pos(mat, v, cage)
-                        vert_weights.append((wp, w))
-            else:
-                vg_idx = vg.index
-                for vert in mesh.vertices:
-                    w = 0.0
-                    for ge in vert.groups:
-                        if ge.group == vg_idx:
-                            w = ge.weight
-                            break
-                    if w > 0.0:
-                        wp = vert_world_pos(mat, vert, cage)
-                        vert_weights.append((wp, w))
+    if vert_weights is None:
+        bms = {}
+        if s.viz_mode == 'PROPORTIONAL':
+            for obj in edit_objs:
+                bms[obj] = bmesh.from_edit_mesh(obj.data)
+        elif ctx.mode == 'EDIT_MESH' and s.viz_mode in ('SHAPE_KEY', 'VERTEX_GROUP'):
+            for obj in edit_objs:
+                bms[obj] = bmesh.from_edit_mesh(obj.data)
 
-        if not vert_weights: return
+        # ------- VERTEX GROUP mode -------
+        if s.viz_mode == 'VERTEX_GROUP':
+            vert_weights = []
+            for obj in edit_objs:
+                mat = obj.matrix_world
+                cage = cage_coords_by_obj.get(obj)
+                mesh = obj.data
 
-    # ------- SHAPE KEY mode -------
-    elif s.viz_mode == 'SHAPE_KEY':
-        vert_weights = []
-        for obj in edit_objs:
-            mesh = obj.data
-            if not mesh.shape_keys or not mesh.shape_keys.key_blocks:
-                continue
+                vg = obj.vertex_groups.get(s.vgroup_name) if s.vgroup_name else None
+                if not vg:
+                    vg = obj.vertex_groups.active
+                if not vg:
+                    continue
 
-            sk = mesh.shape_keys.key_blocks.get(s.shape_key_name) if s.shape_key_name else None
-            if not sk:
-                idx = obj.active_shape_key_index
-                if 0 <= idx < len(mesh.shape_keys.key_blocks):
-                    sk = mesh.shape_keys.key_blocks[idx]
-            if not sk:
-                continue
+                bm = bms.get(obj)
+                if bm is not None:
+                    dvert_layer = bm.verts.layers.deform.verify()
+                    vg_idx = vg.index
+                    for v in bm.verts:
+                        w = v[dvert_layer].get(vg_idx, 0.0)
+                        if w > 0.0:
+                            wp = vert_world_pos(mat, v, cage)
+                            vert_weights.append((wp, w))
+                else:
+                    vg_idx = vg.index
+                    for vert in mesh.vertices:
+                        w = 0.0
+                        for ge in vert.groups:
+                            if ge.group == vg_idx:
+                                w = ge.weight
+                                break
+                        if w > 0.0:
+                            wp = vert_world_pos(mat, vert, cage)
+                            vert_weights.append((wp, w))
 
-            basis = mesh.shape_keys.reference_key
-            bm = bms.get(obj)
-            # In mesh edit + shape key edit mode, bmesh only tracks the *active* key.
-            idx_act = obj.active_shape_key_index
-            sk_is_active = (
-                0 <= idx_act < len(mesh.shape_keys.key_blocks)
-                and mesh.shape_keys.key_blocks[idx_act] == sk
-            )
-            in_sk_edit = (
-                bm is not None
-                and obj.use_shape_key_edit_mode
-                and sk is not basis
-                and sk_is_active
-            )
-            if in_sk_edit:
-                bm.verts.ensure_lookup_table()
-                displacements = [
-                    (bm.verts[i].co - basis.data[i].co).length
-                    for i in range(len(mesh.vertices))
-                ]
-            else:
-                displacements = [
-                    (sk.data[i].co - basis.data[i].co).length
-                    for i in range(len(mesh.vertices))
-                ]
-            max_d = max(displacements) if displacements else 0.0
-            if max_d < 1e-6:
-                continue
+            if not vert_weights: return
 
-            mat = obj.matrix_world
-            cage = cage_coords_by_obj.get(obj)
-            if bm is not None:
-                bm.verts.ensure_lookup_table()
-                for v in bm.verts:
-                    d = displacements[v.index]
-                    if d > 0.0:
-                        wp = vert_world_pos(mat, v, cage)
-                        vert_weights.append((wp, d / max_d))
-            else:
-                for vert in mesh.vertices:
-                    d = displacements[vert.index]
-                    if d > 0.0:
-                        wp = vert_world_pos(mat, vert, cage)
-                        vert_weights.append((wp, d / max_d))
+        # ------- SHAPE KEY mode -------
+        elif s.viz_mode == 'SHAPE_KEY':
+            vert_weights = []
+            for obj in edit_objs:
+                mesh = obj.data
+                if not mesh.shape_keys or not mesh.shape_keys.key_blocks:
+                    continue
 
-        if not vert_weights: return
+                sk = mesh.shape_keys.key_blocks.get(s.shape_key_name) if s.shape_key_name else None
+                if not sk:
+                    idx = obj.active_shape_key_index
+                    if 0 <= idx < len(mesh.shape_keys.key_blocks):
+                        sk = mesh.shape_keys.key_blocks[idx]
+                if not sk:
+                    continue
 
-    # ------- PROPORTIONAL mode -------
-    else:
-        # During a live transform, use the spy-tracked estimate if available;
-        # ts.proportional_size is stale inside the modal until the operator exits.
-        rad = _SV_MODAL_RADIUS if (_SV_MODAL_RADIUS is not None) else ts.proportional_size
+                basis = mesh.shape_keys.reference_key
+                bm = bms.get(obj)
+                # In mesh edit + shape key edit mode, bmesh only tracks the *active* key.
+                idx_act = obj.active_shape_key_index
+                sk_is_active = (
+                    0 <= idx_act < len(mesh.shape_keys.key_blocks)
+                    and mesh.shape_keys.key_blocks[idx_act] == sk
+                )
+                in_sk_edit = (
+                    bm is not None
+                    and obj.use_shape_key_edit_mode
+                    and sk is not basis
+                    and sk_is_active
+                )
+                if in_sk_edit:
+                    bm.verts.ensure_lookup_table()
+                    displacements = [
+                        (bm.verts[i].co - basis.data[i].co).length
+                        for i in range(len(mesh.vertices))
+                    ]
+                else:
+                    displacements = [
+                        (sk.data[i].co - basis.data[i].co).length
+                        for i in range(len(mesh.vertices))
+                    ]
+                max_d = max(displacements) if displacements else 0.0
+                if max_d < 1e-6:
+                    continue
 
-        cache_key_elements = [
-            rad,
-            ts.proportional_edit_falloff,
-            ts.use_proportional_connected,
-        ]
+                mat = obj.matrix_world
+                cage = cage_coords_by_obj.get(obj)
+                if bm is not None:
+                    bm.verts.ensure_lookup_table()
+                    for v in bm.verts:
+                        d = displacements[v.index]
+                        if d > 0.0:
+                            wp = vert_world_pos(mat, v, cage)
+                            vert_weights.append((wp, d / max_d))
+                else:
+                    for vert in mesh.vertices:
+                        d = displacements[vert.index]
+                        if d > 0.0:
+                            wp = vert_world_pos(mat, vert, cage)
+                            vert_weights.append((wp, d / max_d))
 
-        for obj in edit_objs:
-            bm = bms[obj]
-            mat = obj.matrix_world
-            sel_indices = tuple(v.index for v in bm.verts if v.select)
-            cache_key_elements.extend([
-                obj.name,
-                len(bm.verts),
-                len(bm.edges),
-                sel_indices,
-                tuple(mat.col[3]),
-                modifier_edit_display_signature(obj),
-                obj.use_shape_key_edit_mode,
-                obj.use_mesh_mirror_x,
-                obj.use_mesh_mirror_y,
-                obj.use_mesh_mirror_z,
-            ])
+            if not vert_weights: return
 
-        current_hash = hash(tuple(cache_key_elements))
+        # ------- PROPORTIONAL mode -------
+        else:
+            # During a live transform, use the spy-tracked estimate if available;
+            # ts.proportional_size is stale inside the modal until the operator exits.
+            rad = _SV_MODAL_RADIUS if (_SV_MODAL_RADIUS is not None) else ts.proportional_size
 
-        coord_elements = []
-        for obj in edit_objs:
-            bm = bms[obj]
-            mat = obj.matrix_world
-            cage = cage_coords_by_obj.get(obj)
-            for v in bm.verts:
-                if v.select:
-                    wp = vert_world_pos(mat, v, cage)
-                    coord_elements.extend([round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)])
-        current_coord_hash = hash(tuple(coord_elements))
+            cache_key_elements = [
+                rad,
+                ts.proportional_edit_falloff,
+                ts.use_proportional_connected,
+            ]
 
-        if current_coord_hash != VIZ_CACHE.coord_hash:
-            VIZ_CACHE.coord_hash = current_coord_hash
-            VIZ_CACHE.last_change_time = time.time()
-            VIZ_CACHE.is_dirty = True
+            for obj in edit_objs:
+                bm = bms[obj]
+                mat = obj.matrix_world
+                sel_indices = tuple(v.index for v in bm.verts if v.select)
+                cache_key_elements.extend([
+                    obj.name,
+                    len(bm.verts),
+                    len(bm.edges),
+                    sel_indices,
+                    tuple(mat.col[3]),
+                    modifier_edit_display_signature(obj),
+                    obj.use_shape_key_edit_mode,
+                    obj.use_mesh_mirror_x,
+                    obj.use_mesh_mirror_y,
+                    obj.use_mesh_mirror_z,
+                ])
 
-        rebuild = False
+            current_hash = hash(tuple(cache_key_elements))
 
-        if _SV_MODAL_RADIUS is not None:
-            # Spy-keyed G/R/S session: recalc every frame while dragging/scrolling.
-            rebuild = True
-            VIZ_CACHE.is_dirty = False
-        elif current_hash != VIZ_CACHE.hash:
-            rebuild = True
-            VIZ_CACHE.hash = current_hash
-            VIZ_CACHE.is_dirty = False
-
-        elif VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
-            rebuild = True
-            VIZ_CACHE.is_dirty = False
-
-        if rebuild:
-            VIZ_CACHE.weights.clear()
-            snap = _SV_TRANSFORM_SNAPSHOT
-
-            global_centers = []
+            coord_elements = []
             for obj in edit_objs:
                 bm = bms[obj]
                 mat = obj.matrix_world
                 cage = cage_coords_by_obj.get(obj)
-                sel = [v for v in bm.verts if v.select]
-                for v in sel:
-                    global_centers.append(
-                        _snap_vert_world(snap, obj, v.index, mat, v, cage))
-                VIZ_CACHE.weights[obj.name] = []
+                for v in bm.verts:
+                    if v.select:
+                        wp = vert_world_pos(mat, v, cage)
+                        coord_elements.extend([round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)])
+            current_coord_hash = hash(tuple(coord_elements))
 
-            if global_centers:
-                if ts.use_proportional_connected:
-                    for obj in edit_objs:
-                        bm = bms[obj]
-                        mat = obj.matrix_world
-                        cage = cage_coords_by_obj.get(obj)
-                        sel = [v for v in bm.verts if v.select]
-                        if not sel: continue
+            if current_coord_hash != VIZ_CACHE.coord_hash:
+                VIZ_CACHE.coord_hash = current_coord_hash
+                VIZ_CACHE.last_change_time = time.time()
+                VIZ_CACHE.is_dirty = True
 
-                        distances = {v: 0.0 for v in sel}
-                        pq = [(0.0, v.index, v) for v in sel]
-                        heapq.heapify(pq)
+            rebuild = False
 
-                        obj_weights = []
-                        while pq:
-                            dist, _, v = heapq.heappop(pq)
+            if _SV_MODAL_RADIUS is not None:
+                # Spy-keyed G/R/S session: recalc every frame while dragging/scrolling.
+                rebuild = True
+                VIZ_CACHE.is_dirty = False
+            elif current_hash != VIZ_CACHE.hash:
+                rebuild = True
+                VIZ_CACHE.hash = current_hash
+                VIZ_CACHE.is_dirty = False
 
-                            if dist > distances.get(v, float('inf')): continue
+            elif VIZ_CACHE.is_dirty and (time.time() - VIZ_CACHE.last_change_time) > 0.2:
+                rebuild = True
+                VIZ_CACHE.is_dirty = False
 
-                            w = falloff(dist / rad, ts.proportional_edit_falloff)
-                            if w > 0.0:
-                                obj_weights.append((v.index, w))
+            if rebuild:
+                VIZ_CACHE.weights.clear()
+                snap = _SV_TRANSFORM_SNAPSHOT
 
-                            for edge in v.link_edges:
-                                neighbor = edge.other_vert(v)
-                                p_v = _snap_vert_world(snap, obj, v.index, mat, v, cage)
-                                p_n = _snap_vert_world(
-                                    snap, obj, neighbor.index, mat, neighbor, cage)
-                                edge_len = (p_v - p_n).length
-                                new_dist = dist + edge_len
+                global_centers = []
+                for obj in edit_objs:
+                    bm = bms[obj]
+                    mat = obj.matrix_world
+                    cage = cage_coords_by_obj.get(obj)
+                    sel = [v for v in bm.verts if v.select]
+                    for v in sel:
+                        global_centers.append(
+                            _snap_vert_world(snap, obj, v.index, mat, v, cage))
+                    VIZ_CACHE.weights[obj.name] = []
 
-                                if new_dist <= rad:
-                                    if new_dist < distances.get(neighbor, float('inf')):
-                                        distances[neighbor] = new_dist
-                                        heapq.heappush(pq, (new_dist, neighbor.index, neighbor))
+                if global_centers:
+                    if ts.use_proportional_connected:
+                        for obj in edit_objs:
+                            bm = bms[obj]
+                            mat = obj.matrix_world
+                            cage = cage_coords_by_obj.get(obj)
+                            sel = [v for v in bm.verts if v.select]
+                            if not sel: continue
 
-                        VIZ_CACHE.weights[obj.name] = obj_weights
+                            distances = {v: 0.0 for v in sel}
+                            pq = [(0.0, v.index, v) for v in sel]
+                            heapq.heapify(pq)
 
-                else:
-                    kd = kdtree.KDTree(len(global_centers))
-                    for i, c in enumerate(global_centers):
-                        kd.insert(c, i)
-                    kd.balance()
+                            obj_weights = []
+                            while pq:
+                                dist, _, v = heapq.heappop(pq)
 
-                    for obj in edit_objs:
-                        bm = bms[obj]
-                        mat = obj.matrix_world
-                        cage = cage_coords_by_obj.get(obj)
-                        obj_weights = []
-                        for v in bm.verts:
-                            wp = _snap_vert_world(snap, obj, v.index, mat, v, cage)
-                            _, _, dist = kd.find(wp)
-                            if dist <= rad:
+                                if dist > distances.get(v, float('inf')): continue
+
                                 w = falloff(dist / rad, ts.proportional_edit_falloff)
                                 if w > 0.0:
                                     obj_weights.append((v.index, w))
 
-                        VIZ_CACHE.weights[obj.name] = obj_weights
+                                for edge in v.link_edges:
+                                    neighbor = edge.other_vert(v)
+                                    p_v = _snap_vert_world(snap, obj, v.index, mat, v, cage)
+                                    p_n = _snap_vert_world(
+                                        snap, obj, neighbor.index, mat, neighbor, cage)
+                                    edge_len = (p_v - p_n).length
+                                    new_dist = dist + edge_len
 
-        if rebuild:
-            cached_vw = []
-            for obj in edit_objs:
-                if obj.name not in VIZ_CACHE.weights: continue
-                bm = bms[obj]
-                mat = obj.matrix_world
-                cage = cage_coords_by_obj.get(obj)
-                bm.verts.ensure_lookup_table()
-                for v_idx, w in VIZ_CACHE.weights[obj.name]:
-                    try:
-                        v = bm.verts[v_idx]
-                        wp = vert_world_pos(mat, v, cage)
-                        for wp_sym in proportional_mirror_world_positions(obj, mat, wp):
-                            cached_vw.append((wp_sym, w))
-                    except IndexError:
-                        pass
-            VIZ_CACHE.vert_weights = cached_vw
+                                    if new_dist <= rad:
+                                        if new_dist < distances.get(neighbor, float('inf')):
+                                            distances[neighbor] = new_dist
+                                            heapq.heappush(pq, (new_dist, neighbor.index, neighbor))
 
-        vert_weights = VIZ_CACHE.vert_weights if VIZ_CACHE.vert_weights is not None else []
-        if not vert_weights: return
+                            VIZ_CACHE.weights[obj.name] = obj_weights
+
+                    else:
+                        kd = kdtree.KDTree(len(global_centers))
+                        for i, c in enumerate(global_centers):
+                            kd.insert(c, i)
+                        kd.balance()
+
+                        for obj in edit_objs:
+                            bm = bms[obj]
+                            mat = obj.matrix_world
+                            cage = cage_coords_by_obj.get(obj)
+                            obj_weights = []
+                            for v in bm.verts:
+                                wp = _snap_vert_world(snap, obj, v.index, mat, v, cage)
+                                _, _, dist = kd.find(wp)
+                                if dist <= rad:
+                                    w = falloff(dist / rad, ts.proportional_edit_falloff)
+                                    if w > 0.0:
+                                        obj_weights.append((v.index, w))
+
+                            VIZ_CACHE.weights[obj.name] = obj_weights
+
+            if rebuild:
+                cached_vw = []
+                for obj in edit_objs:
+                    if obj.name not in VIZ_CACHE.weights: continue
+                    bm = bms[obj]
+                    mat = obj.matrix_world
+                    cage = cage_coords_by_obj.get(obj)
+                    bm.verts.ensure_lookup_table()
+                    for v_idx, w in VIZ_CACHE.weights[obj.name]:
+                        try:
+                            v = bm.verts[v_idx]
+                            wp = vert_world_pos(mat, v, cage)
+                            for wp_sym in proportional_mirror_world_positions(obj, mat, wp):
+                                cached_vw.append((wp_sym, w))
+                        except IndexError:
+                            pass
+                VIZ_CACHE.vert_weights = cached_vw
+
+            vert_weights = VIZ_CACHE.vert_weights if VIZ_CACHE.vert_weights is not None else []
+            if not vert_weights: return
+
+        if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY') and ctx.mode == 'EDIT_MESH':
+            VIZ_CACHE.edit_vw_list = vert_weights
+            VIZ_CACHE.edit_vw_sig = _softviz_edit_vg_sk_cache_signature(s, edit_objs)
 
     global SHADER, SOFTVIZ_SHADER_FAILED
     if SHADER is None and not SOFTVIZ_SHADER_FAILED:
@@ -784,7 +895,7 @@ def draw_callback():
     # Batch stores center positions + corner offsets + pre-baked colors.
     # Camera orientation and dot_size are passed as uniforms every frame,
     # so the batch only needs rebuilding when the underlying weights or
-    # colors change — not on every camera move or mode switch.
+    # colors change - not on every camera move or mode switch.
     if s.viz_mode == 'PROPORTIONAL':
         data_hash = VIZ_CACHE.hash
         # VIZ_CACHE.hash omits per-vertex coords and is not advanced every modal frame
@@ -852,7 +963,7 @@ def draw_callback():
             screen_mode = 1
         else:
             # Same world-space factor as perspective (depth * dot * 0.0005 in the
-            # shader), using view_distance so size matches when toggling ortho — the
+            # shader), using view_distance so size matches when toggling ortho - the
             # old pixel-based ortho size was visually smaller than this tuned formula.
             screen_mode = 2
             depth_ref = max(0.01, float(rv3d.view_distance))
@@ -937,7 +1048,7 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
     def modal(self, context, event):
         global _SV_MODAL_RADIUS, _SV_TRANSFORM_SNAPSHOT
 
-        # Previous event was a confirm/cancel — transform has now exited and
+        # Previous event was a confirm/cancel - transform has now exited and
         # ts.proportional_size reflects the committed value.
         if self._ending:
             final = context.scene.tool_settings.proportional_size
@@ -987,6 +1098,7 @@ class VIEW3D_OT_softviz_toggle(bpy.types.Operator):
                 draw_callback, (), 'WINDOW', 'POST_VIEW')
 
             scene.softviz_running = True
+            VIZ_CACHE.mesh_eval_dirty = True
 
         for window in context.window_manager.windows:
             for area in window.screen.areas:
@@ -1044,7 +1156,7 @@ class VIEW3D_PT_softviz(bpy.types.Panel):
                 for line in warn[:6]:
                     box.label(text=line)
                 if len(warn) > 6:
-                    box.label(text=f"… +{len(warn) - 6} more")
+                    box.label(text=f"... +{len(warn) - 6} more")
                 box.label(text="SoftViz cannot match subdiv/cage verts to mesh indices.")
 
 
@@ -1152,6 +1264,7 @@ def register():
     bpy.types.Scene.softviz_running = bpy.props.BoolProperty(default=False)
 
     bpy.app.handlers.load_post.append(softviz_load_post)
+    bpy.app.handlers.depsgraph_update_post.append(softviz_depsgraph_update_post)
     
     if not bpy.app.timers.is_registered(init_nodegroup_timer):
         bpy.app.timers.register(init_nodegroup_timer, first_interval=0.1)
@@ -1173,6 +1286,9 @@ def unregister():
 
     if softviz_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(softviz_load_post)
+
+    if softviz_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(softviz_depsgraph_update_post)
         
     if bpy.app.timers.is_registered(init_nodegroup_timer):
         bpy.app.timers.unregister(init_nodegroup_timer)

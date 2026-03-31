@@ -2,9 +2,9 @@
 
 ## Proportional radius during transform (API)
 
-We cannot know the current proportional radius during transform from RNA alone. Blender doesn't expose it until the modal operator updates its internal state (often on mouse move or confirm, not scroll). Any approach that only reads `ts.proportional_size` during the modal is unreliable.
+We cannot know the current proportional radius during transform from RNA alone. Blender does not expose it until the modal operator updates its internal state (often on mouse move or confirm, not scroll). Any approach that only reads `ts.proportional_size` during the modal is unreliable.
 
-**Mitigation in this add-on:** a keymap-triggered operator with `MODAL_PRIORITY` runs alongside G/R/S, sees wheel events (with `PASS_THROUGH` to the transform), tracks an estimated radius, and snapshots mesh world positions at transform start so fall distances match Blender’s proportional field while verts move.
+**Mitigation in this add-on:** a keymap-triggered operator with `MODAL_PRIORITY` runs alongside G/R/S, sees wheel events (with `PASS_THROUGH` to the transform), tracks an estimated radius, and snapshots mesh world positions at transform start so fall distances match Blender's proportional field while verts move.
 
 ```python
 # Starting radius is accurate before the transform modal owns the event loop
@@ -13,7 +13,7 @@ last_known_radius = ts.proportional_size
 bpy.ops.transform.translate('INVOKE_DEFAULT')
 ```
 
-Older idea: infer scroll from final vs initial radius after confirm — still valid as a cross-check.
+Older idea: infer scroll from final vs initial radius after confirm - still valid as a cross-check.
 
 ### Event order and `MODAL_PRIORITY`
 
@@ -39,7 +39,7 @@ class MyEventSpyOperator(bpy.types.Operator):
 
 ### Spy / operator return values
 
-When the spy does not attach its own modal (`_softviz_spy_should_run` is false), `invoke` must not return `{'RUNNING_MODAL'}` without `modal_handler_add(self)` — it runs the transform and returns `{'FINISHED'}` (or `{'CANCELLED'}`) so only the transform owns the modal stack.
+When the spy does not attach its own modal (`_softviz_spy_should_run` is false), `invoke` must not return `{'RUNNING_MODAL'}` without `modal_handler_add(self)` - it runs the transform and returns `{'FINISHED'}` (or `{'CANCELLED'}`) so only the transform owns the modal stack.
 
 ### `bpy.data` during register
 
@@ -76,13 +76,13 @@ Weights are rebuilt when inputs change; during an active spy session, proportion
 ## Transform + scroll sync (current behavior)
 
 - **Scroll radius:** `MODAL_PRIORITY` spy adjusts an internal `_SV_MODAL_RADIUS` and uses it in `draw_callback` while RNA may be stale.
-- **Falloff vs large drags:** `_SV_TRANSFORM_SNAPSHOT` stores per-vertex world positions at G/R/S start; weight math uses the snapshot during the spy session so the field does not “travel” incorrectly with dragged verts.
+- **Falloff vs large drags:** `_SV_TRANSFORM_SNAPSHOT` stores per-vertex world positions at G/R/S start; weight math uses the snapshot during the spy session so the field does not "travel" incorrectly with dragged verts.
 - **Spy gating:** runs only when the heatmap is on, panel mode is **Proportional**, and Blender **proportional editing** is enabled (`_softviz_spy_should_run`).
-- **Keymap:** the spy is registered on addon **Mesh** keymap items for **G**, **R**, and **S** (unmodified). Starting move/rotate/scale only from the toolbar or menus does **not** run the spy — scroll/snapshot sync applies to keyboard shortcuts handled by that keymap.
+- **Keymap:** the spy is registered on addon **Mesh** keymap items for **G**, **R**, and **S** (unmodified). Starting move/rotate/scale only from the toolbar or menus does **not** run the spy - scroll/snapshot sync applies to keyboard shortcuts handled by that keymap.
 
 ---
 
-## Modifier “Display in Edit Mode” (limitations)
+## Modifier "Display in Edit Mode" (limitations)
 
 - SoftViz aligns with **evaluated** vertex positions when a supported **deform** modifier has viewport visibility and **Display in Edit Mode** enabled (e.g. Armature), matching the edit cage for those cases.
 - **Subdivision**, **Multires**, and other topology-changing modifiers are not supported for cage alignment: the Python API does not give a stable mapping from cage verts back to original mesh indices. If only those show in edit mode, the overlay uses base mesh positions.
