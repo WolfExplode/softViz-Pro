@@ -3,10 +3,10 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, kdtree
 
 bl_info = {
-    "name": "SoftViz Pro",
-    "author": "Niels Couvreur",
-    "version": (4, 5, 0),
-    "blender": (4, 5, 0), 
+    "name": "SoftViz",
+    "author": "Niels Couvreur, WXP",
+    "version": (1, 5, 0),
+    "blender": (4, 2, 0),
     "location": "View3D > N-Panel > SoftViz",
     "description": "Advanced, GPU-accelerated heatmap visualizer for Proportional Editing.",
     "doc_url": "", 
@@ -24,7 +24,11 @@ _QUAD_CORNERS = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
 
 # Scroll-spy state — set/cleared by VIEW3D_OT_softviz_transform_spy
 _SV_MODAL_RADIUS = None
+# obj_name -> list[Vector|None] indexed by mesh vertex index; world coords at transform start
+_SV_TRANSFORM_SNAPSHOT = None
 _SV_KEYMAPS = []
+# Transform spy: print start/end/scroll radius to the system console.
+debug = False
 
 # Legacy full GLSL (Blender < 5 still allows gpu.types.GPUShader(vertex, frag)).
 _SOFTVIZ_VERT_LEGACY = """
@@ -409,6 +413,44 @@ def vert_world_pos(mat, v, cage_coords):
         return cage_coords[v.index]
     return mat @ v.co
 
+def _capture_softviz_transform_snapshot(context):
+    """World position per vertex index at G/R/S start — matches Blender proportional falloff basis."""
+    edit_objs = [o for o in context.objects_in_mode if o.type == 'MESH']
+    if not edit_objs:
+        return {}
+    s = context.scene.softviz_settings
+    sk_viz = s.viz_mode == 'SHAPE_KEY'
+    cage_coords_by_obj = {}
+    for obj in edit_objs:
+        if object_needs_evaluated_deform_cage(obj, shape_key_visualization=sk_viz):
+            c = eval_vert_world_coords_for_draw_cage(
+                obj, context, len(obj.data.vertices))
+            if c is not None:
+                cage_coords_by_obj[obj] = c
+    snap = {}
+    for obj in edit_objs:
+        bm = bmesh.from_edit_mesh(obj.data)
+        mat = obj.matrix_world
+        cage = cage_coords_by_obj.get(obj)
+        n = len(obj.data.vertices)
+        coords = [None] * n
+        bm.verts.ensure_lookup_table()
+        for v in bm.verts:
+            if v.index < n:
+                coords[v.index] = vert_world_pos(mat, v, cage).copy()
+        snap[obj.name] = coords
+    return snap
+
+def _snap_vert_world(snapshot, obj, vert_index, mat, v, cage):
+    """World pos for weight math during modal: snapshot if valid, else live cage pos."""
+    if snapshot:
+        row = snapshot.get(obj.name)
+        if row and vert_index < len(row):
+            p = row[vert_index]
+            if p is not None:
+                return p
+    return vert_world_pos(mat, v, cage)
+
 # -------------------------------------------------
 # DRAW
 # -------------------------------------------------
@@ -578,6 +620,7 @@ def draw_callback():
 
         if rebuild:
             VIZ_CACHE.weights.clear()
+            snap = _SV_TRANSFORM_SNAPSHOT
 
             global_centers = []
             for obj in edit_objs:
@@ -585,7 +628,9 @@ def draw_callback():
                 mat = obj.matrix_world
                 cage = cage_coords_by_obj.get(obj)
                 sel = [v for v in bm.verts if v.select]
-                global_centers.extend([vert_world_pos(mat, v, cage) for v in sel])
+                for v in sel:
+                    global_centers.append(
+                        _snap_vert_world(snap, obj, v.index, mat, v, cage))
                 VIZ_CACHE.weights[obj.name] = []
 
             if global_centers:
@@ -613,8 +658,9 @@ def draw_callback():
 
                             for edge in v.link_edges:
                                 neighbor = edge.other_vert(v)
-                                p_v = vert_world_pos(mat, v, cage)
-                                p_n = vert_world_pos(mat, neighbor, cage)
+                                p_v = _snap_vert_world(snap, obj, v.index, mat, v, cage)
+                                p_n = _snap_vert_world(
+                                    snap, obj, neighbor.index, mat, neighbor, cage)
                                 edge_len = (p_v - p_n).length
                                 new_dist = dist + edge_len
 
@@ -637,7 +683,7 @@ def draw_callback():
                         cage = cage_coords_by_obj.get(obj)
                         obj_weights = []
                         for v in bm.verts:
-                            wp = vert_world_pos(mat, v, cage)
+                            wp = _snap_vert_world(snap, obj, v.index, mat, v, cage)
                             _, _, dist = kd.find(wp)
                             if dist <= rad:
                                 w = falloff(dist / rad, ts.proportional_edit_falloff)
@@ -820,28 +866,33 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
     )
 
     def invoke(self, context, event):
-        global _SV_MODAL_RADIUS
+        global _SV_MODAL_RADIUS, _SV_TRANSFORM_SNAPSHOT
         if not _softviz_spy_should_run(context):
             return _TRANSFORM_OPS[self.transform_type]()
+        snap = _capture_softviz_transform_snapshot(context)
         result = _TRANSFORM_OPS[self.transform_type]()
         # If nothing was selected / transform cancelled immediately, don't go modal.
         if 'RUNNING_MODAL' not in result and 'FINISHED' not in result:
             return {'CANCELLED'}
+        _SV_TRANSFORM_SNAPSHOT = snap
         _SV_MODAL_RADIUS = context.scene.tool_settings.proportional_size
         self._ending = False
-        print(f"[SoftVizSpy] transform started  | initial radius = {_SV_MODAL_RADIUS:.4f}")
+        if debug:
+            print(f"[SoftVizSpy] transform started  | initial radius = {_SV_MODAL_RADIUS:.4f}")
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        global _SV_MODAL_RADIUS
+        global _SV_MODAL_RADIUS, _SV_TRANSFORM_SNAPSHOT
 
         # Previous event was a confirm/cancel — transform has now exited and
         # ts.proportional_size reflects the committed value.
         if self._ending:
             final = context.scene.tool_settings.proportional_size
-            print(f"[SoftVizSpy] transform ended    | final radius   = {final:.4f}")
+            if debug:
+                print(f"[SoftVizSpy] transform ended    | final radius   = {final:.4f}")
             _SV_MODAL_RADIUS = None
+            _SV_TRANSFORM_SNAPSHOT = None
             return {'FINISHED'}
 
         # Detect confirm / cancel events; let transform consume them too.
@@ -852,11 +903,13 @@ class VIEW3D_OT_softviz_transform_spy(bpy.types.Operator):
 
         if event.type == 'WHEELUPMOUSE' and _SV_MODAL_RADIUS is not None:
             _SV_MODAL_RADIUS /= 1.1
-            print(f"[SoftVizSpy] SCROLL UP          | est. radius    = {_SV_MODAL_RADIUS:.4f}")
+            if debug:
+                print(f"[SoftVizSpy] SCROLL UP          | est. radius    = {_SV_MODAL_RADIUS:.4f}")
 
         elif event.type == 'WHEELDOWNMOUSE' and _SV_MODAL_RADIUS is not None:
             _SV_MODAL_RADIUS *= 1.1
-            print(f"[SoftVizSpy] SCROLL DOWN        | est. radius    = {_SV_MODAL_RADIUS:.4f}")
+            if debug:
+                print(f"[SoftVizSpy] SCROLL DOWN        | est. radius    = {_SV_MODAL_RADIUS:.4f}")
 
         return {'PASS_THROUGH'}
 
@@ -914,7 +967,7 @@ class SoftVizSettings(bpy.types.PropertyGroup):
 # UI
 # -------------------------------------------------
 class VIEW3D_PT_softviz(bpy.types.Panel):
-    bl_label = "SoftViz 4.5"
+    bl_label = "SoftViz for blender v4.2+"
     bl_idname = "VIEW3D_PT_softviz"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'

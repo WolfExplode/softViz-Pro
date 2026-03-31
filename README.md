@@ -1,7 +1,7 @@
 # softViz-Pro
 SoftViz Pro: Implementation & Technical Overview
 
-SoftViz Pro is a viewport overlay for Blender 4.5 and 5 designed to bridge the feedback gap in the Proportional Editing workflow. While Blender’s native tool uses a 2D circle to represent a 3D influence, SoftViz calculates and draws a per-vertex heatmap directly onto the geometry (similar to 3dsMax, maya,...).
+SoftViz Pro is a viewport overlay for Blender 4.2+ designed to bridge the feedback gap in the Proportional Editing workflow. While Blender’s native tool uses a 2D circle to represent a 3D influence, SoftViz calculates and draws a per-vertex heatmap directly onto the geometry (similar to 3dsMax, maya,...).
 
 ---
 Usage:
