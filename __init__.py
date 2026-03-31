@@ -157,15 +157,24 @@ def remove_draw_handler():
     SHADER = None
     SOFTVIZ_SHADER_FAILED = False
 
+def sync_softviz_draw_handler():
+    """Match POST_VIEW draw handler to scene softviz_running (handlers are not saved in .blend)."""
+    global DRAW_HANDLE
+    any_on = any(getattr(s, "softviz_running", False) for s in bpy.data.scenes)
+    remove_draw_handler()
+    if not any_on:
+        return
+    ensure_nodegroup()
+    DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+        draw_callback, (), 'WINDOW', 'POST_VIEW')
+
 @bpy.app.handlers.persistent
 def softviz_load_post(dummy):
-    remove_draw_handler()
-
     for scene in bpy.data.scenes:
-        scene.softviz_running = False
         # Force native Connected Only to default to OFF on load
         scene.tool_settings.use_proportional_connected = False
-        
+
+    sync_softviz_draw_handler()
     if not bpy.app.timers.is_registered(init_nodegroup_timer):
         bpy.app.timers.register(init_nodegroup_timer, first_interval=0.1)
 
@@ -213,9 +222,11 @@ def build_default_ramp(r):
 def ensure_nodegroup():
     ng = bpy.data.node_groups.get(NG_NAME)
     if ng:
+        ng.use_fake_user = True
         return ng
 
     ng = bpy.data.node_groups.new(NG_NAME, 'ShaderNodeTree')
+    ng.use_fake_user = True
     node = ng.nodes.new("ShaderNodeValToRGB")
     build_default_ramp(node.color_ramp)
 
@@ -231,6 +242,15 @@ def get_ramp_node():
         if n.type == 'VALTORGB':
             return n
     return None
+
+def remove_softviz_ramp_nodegroup():
+    """Remove addon-owned node group (e.g. on unregister / disable add-on)."""
+    ng = bpy.data.node_groups.get(NG_NAME)
+    if ng is not None:
+        ng.use_fake_user = False
+        bpy.data.node_groups.remove(ng)
+    VIZ_CACHE.ramp_lut = None
+    VIZ_CACHE.ramp_lut_key = None
 
 def get_or_bake_lut(ramp_node):
     if ramp_node is None:
@@ -295,9 +315,12 @@ def modifier_edit_display_signature(obj):
         for m in obj.modifiers
     )
 
-def object_needs_evaluated_deform_cage(obj):
+def object_needs_evaluated_deform_cage(obj, shape_key_visualization=False):
     if obj.type == 'MESH' and obj.data.shape_keys:
         if getattr(obj, "use_shape_key_edit_mode", False):
+            return True
+        # Edit-mode bmesh is the basis cage; viewport shows evaluated shape keys.
+        if shape_key_visualization:
             return True
     for mod in obj.modifiers:
         if mod.show_viewport and mod.show_in_editmode:
@@ -387,6 +410,8 @@ def transform_modal_active(ctx):
 # -------------------------------------------------
 def draw_callback():
     ctx = bpy.context
+    if not getattr(ctx.scene, "softviz_running", False):
+        return
     ts = ctx.tool_settings
     s = ctx.scene.softviz_settings
 
@@ -409,8 +434,9 @@ def draw_callback():
 
     live_tf = transform_modal_active(ctx)
     cage_coords_by_obj = {}
+    sk_viz = s.viz_mode == 'SHAPE_KEY'
     for obj in edit_objs:
-        if object_needs_evaluated_deform_cage(obj):
+        if object_needs_evaluated_deform_cage(obj, shape_key_visualization=sk_viz):
             c = eval_vert_world_coords_for_draw_cage(
                 obj, ctx, len(obj.data.vertices))
             if c is not None:
@@ -457,18 +483,26 @@ def draw_callback():
                 continue
 
             basis = mesh.shape_keys.reference_key
-            displacements = [
-                (sk.data[i].co - basis.data[i].co).length
-                for i in range(len(mesh.vertices))
-            ]
+            bm = bms[obj]
+            bm.verts.ensure_lookup_table()
+            # In shape key edit mode, bm.verts[i].co is the live edited position.
+            in_sk_edit = getattr(obj, "use_shape_key_edit_mode", False) and sk is not basis
+            if in_sk_edit:
+                displacements = [
+                    (bm.verts[i].co - basis.data[i].co).length
+                    for i in range(len(mesh.vertices))
+                ]
+            else:
+                displacements = [
+                    (sk.data[i].co - basis.data[i].co).length
+                    for i in range(len(mesh.vertices))
+                ]
             max_d = max(displacements) if displacements else 0.0
             if max_d < 1e-6:
                 continue
 
-            bm = bms[obj]
             mat = obj.matrix_world
             cage = cage_coords_by_obj.get(obj)
-            bm.verts.ensure_lookup_table()
             for v in bm.verts:
                 d = displacements[v.index]
                 if d > 0.0:
@@ -920,8 +954,13 @@ def register():
     if not bpy.app.timers.is_registered(softviz_cache_timer):
         bpy.app.timers.register(softviz_cache_timer)
 
+    sync_softviz_draw_handler()
+
 def unregister():
     remove_draw_handler()
+
+    for scene in bpy.data.scenes:
+        scene.softviz_running = False
 
     if softviz_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(softviz_load_post)
@@ -931,6 +970,8 @@ def unregister():
         
     if bpy.app.timers.is_registered(softviz_cache_timer):
         bpy.app.timers.unregister(softviz_cache_timer)
+
+    remove_softviz_ramp_nodegroup()
 
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
