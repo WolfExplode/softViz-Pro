@@ -152,6 +152,8 @@ class SoftVizCache:
         self.cage_coords_by_obj_cache = {}
         self.edit_vw_list = None
         self.edit_vw_sig = None
+        # obj.name -> selected vert indices; used for proportional idle fast path (skip bmesh).
+        self.prop_sel_by_obj = {}
 
 VIZ_CACHE = SoftVizCache()
 
@@ -177,6 +179,7 @@ def remove_draw_handler():
     VIZ_CACHE.cage_coords_by_obj_cache = {}
     VIZ_CACHE.edit_vw_list = None
     VIZ_CACHE.edit_vw_sig = None
+    VIZ_CACHE.prop_sel_by_obj = {}
     VIZ_CACHE.draw_error_logged = False
     SHADER = None
     SOFTVIZ_SHADER_FAILED = False
@@ -217,6 +220,12 @@ def softviz_depsgraph_update_post(scene, depsgraph):
             return
         if isinstance(id_, bpy.types.Object) and id_.type == 'MESH':
             if getattr(update, 'is_updated_geometry', False) or getattr(update, 'is_updated_transform', False):
+                VIZ_CACHE.mesh_eval_dirty = True
+                return
+            ctx = bpy.context
+            oim = getattr(ctx, 'objects_in_mode', None)
+            if oim and id_ in oim and getattr(ctx, 'mode', None) == 'EDIT_MESH':
+                # Selection, overlays, etc. (not always tagged as geometry)
                 VIZ_CACHE.mesh_eval_dirty = True
                 return
 
@@ -499,6 +508,41 @@ def _softviz_edit_vg_sk_cache_signature(settings, edit_objs):
                 sig.append(0.0)
     return tuple(sig)
 
+def _softviz_proportional_cache_key_elements(ts, edit_objs, bm_by_obj, sel_by_name=None):
+    """Match draw order for cache_key_elements. bm_by_obj set = use live bmesh; else sel_by_name + mesh counts."""
+    global _SV_MODAL_RADIUS
+    rad = _SV_MODAL_RADIUS if _SV_MODAL_RADIUS is not None else ts.proportional_size
+    cache_key_elements = [
+        rad,
+        ts.proportional_edit_falloff,
+        ts.use_proportional_connected,
+    ]
+    for obj in edit_objs:
+        if bm_by_obj is not None:
+            bm = bm_by_obj[obj]
+            sel_indices = tuple(v.index for v in bm.verts if v.select)
+            n_v = len(bm.verts)
+            n_e = len(bm.edges)
+        else:
+            sel_indices = sel_by_name.get(obj.name, ()) if sel_by_name else ()
+            me = obj.data
+            n_v = len(me.vertices)
+            n_e = len(me.edges)
+        mat = obj.matrix_world
+        cache_key_elements.extend([
+            obj.name,
+            n_v,
+            n_e,
+            sel_indices,
+            tuple(mat.col[3]),
+            modifier_edit_display_signature(obj),
+            obj.use_shape_key_edit_mode,
+            obj.use_mesh_mirror_x,
+            obj.use_mesh_mirror_y,
+            obj.use_mesh_mirror_z,
+        ])
+    return cache_key_elements
+
 def _capture_softviz_transform_snapshot(context):
     """World position per vertex index at G/R/S start - matches Blender proportional falloff basis."""
     edit_objs = [o for o in context.objects_in_mode if o.type == 'MESH']
@@ -596,6 +640,20 @@ def draw_callback():
         if (not mesh_changed and VIZ_CACHE.edit_vw_sig == cand_sig
                 and VIZ_CACHE.edit_vw_list is not None):
             vert_weights = VIZ_CACHE.edit_vw_list
+
+    if (vert_weights is None
+            and s.viz_mode == 'PROPORTIONAL'
+            and ctx.mode == 'EDIT_MESH'):
+        if (not mesh_changed
+                and _SV_MODAL_RADIUS is None
+                and not VIZ_CACHE.is_dirty
+                and VIZ_CACHE.hash is not None
+                and VIZ_CACHE.vert_weights is not None
+                and VIZ_CACHE.prop_sel_by_obj):
+            cand_elems = _softviz_proportional_cache_key_elements(
+                ts, edit_objs, None, VIZ_CACHE.prop_sel_by_obj)
+            if hash(tuple(cand_elems)) == VIZ_CACHE.hash:
+                vert_weights = VIZ_CACHE.vert_weights
 
     if vert_weights is None:
         bms = {}
@@ -712,30 +770,13 @@ def draw_callback():
             # ts.proportional_size is stale inside the modal until the operator exits.
             rad = _SV_MODAL_RADIUS if (_SV_MODAL_RADIUS is not None) else ts.proportional_size
 
-            cache_key_elements = [
-                rad,
-                ts.proportional_edit_falloff,
-                ts.use_proportional_connected,
-            ]
-
-            for obj in edit_objs:
-                bm = bms[obj]
-                mat = obj.matrix_world
-                sel_indices = tuple(v.index for v in bm.verts if v.select)
-                cache_key_elements.extend([
-                    obj.name,
-                    len(bm.verts),
-                    len(bm.edges),
-                    sel_indices,
-                    tuple(mat.col[3]),
-                    modifier_edit_display_signature(obj),
-                    obj.use_shape_key_edit_mode,
-                    obj.use_mesh_mirror_x,
-                    obj.use_mesh_mirror_y,
-                    obj.use_mesh_mirror_z,
-                ])
-
+            cache_key_elements = _softviz_proportional_cache_key_elements(
+                ts, edit_objs, bms, None)
             current_hash = hash(tuple(cache_key_elements))
+            VIZ_CACHE.prop_sel_by_obj = {
+                obj.name: tuple(v.index for v in bms[obj].verts if v.select)
+                for obj in edit_objs
+            }
 
             coord_elements = []
             for obj in edit_objs:
