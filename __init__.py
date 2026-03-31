@@ -140,6 +140,7 @@ class SoftVizCache:
         self.last_change_time = 0
         self.is_dirty = False
         self.weights = {}
+        self.vert_weights = None
         self.batch = None
         self.batch_hash = None
         self.ramp_lut = None
@@ -165,6 +166,7 @@ def remove_draw_handler():
         DRAW_HANDLE = None
     VIZ_CACHE.batch = None
     VIZ_CACHE.batch_hash = None
+    VIZ_CACHE.vert_weights = None
     VIZ_CACHE.draw_error_logged = False
     SHADER = None
     SOFTVIZ_SHADER_FAILED = False
@@ -468,10 +470,6 @@ def draw_callback():
     if not edit_objs: return
 
     ramp_node = get_ramp_node()
-    if ramp_node:
-        ramp_node.id_data.update_tag()
-        ctx.view_layer.update()
-
     ramp = ramp_node.color_ramp if ramp_node else None
 
     bms = {}
@@ -530,8 +528,17 @@ def draw_callback():
             basis = mesh.shape_keys.reference_key
             bm = bms[obj]
             bm.verts.ensure_lookup_table()
-            # In shape key edit mode, bm.verts[i].co is the live edited position.
-            in_sk_edit = obj.use_shape_key_edit_mode and sk is not basis
+            # In shape key edit mode, bmesh only tracks the *active* shape key.
+            # Use live bm coords only when the resolved key matches that active key;
+            # otherwise read sk.data so shape_key_name is honored.
+            idx_act = obj.active_shape_key_index
+            sk_is_active = (
+                0 <= idx_act < len(mesh.shape_keys.key_blocks)
+                and mesh.shape_keys.key_blocks[idx_act] == sk
+            )
+            in_sk_edit = (
+                obj.use_shape_key_edit_mode and sk is not basis and sk_is_active
+            )
             if in_sk_edit:
                 displacements = [
                     (bm.verts[i].co - basis.data[i].co).length
@@ -692,23 +699,25 @@ def draw_callback():
 
                         VIZ_CACHE.weights[obj.name] = obj_weights
 
-        vert_weights = []
-        for obj in edit_objs:
-            if obj.name not in VIZ_CACHE.weights: continue
-            bm = bms[obj]
-            mat = obj.matrix_world
-            cage = cage_coords_by_obj.get(obj)
-            bm.verts.ensure_lookup_table()
+        if rebuild:
+            cached_vw = []
+            for obj in edit_objs:
+                if obj.name not in VIZ_CACHE.weights: continue
+                bm = bms[obj]
+                mat = obj.matrix_world
+                cage = cage_coords_by_obj.get(obj)
+                bm.verts.ensure_lookup_table()
+                for v_idx, w in VIZ_CACHE.weights[obj.name]:
+                    try:
+                        v = bm.verts[v_idx]
+                        wp = vert_world_pos(mat, v, cage)
+                        for wp_sym in proportional_mirror_world_positions(obj, mat, wp):
+                            cached_vw.append((wp_sym, w))
+                    except IndexError:
+                        pass
+            VIZ_CACHE.vert_weights = cached_vw
 
-            for v_idx, w in VIZ_CACHE.weights[obj.name]:
-                try:
-                    v = bm.verts[v_idx]
-                    wp = vert_world_pos(mat, v, cage)
-                    for wp_sym in proportional_mirror_world_positions(obj, mat, wp):
-                        vert_weights.append((wp_sym, w))
-                except IndexError:
-                    pass
-
+        vert_weights = VIZ_CACHE.vert_weights if VIZ_CACHE.vert_weights is not None else []
         if not vert_weights: return
 
     global SHADER, SOFTVIZ_SHADER_FAILED
@@ -742,15 +751,19 @@ def draw_callback():
     # colors change — not on every camera move or mode switch.
     if s.viz_mode == 'PROPORTIONAL':
         data_hash = VIZ_CACHE.hash
+        # VIZ_CACHE.hash omits per-vertex coords and is not advanced every modal frame
+        # during the spy session. Fingerprint pos + influence so the batch rebakes on
+        # grab (moved verts), scroll radius (weights change at fixed positions), etc.
+        pos_fp = hash(tuple(
+            (round(wp.x, 3), round(wp.y, 3), round(wp.z, 3), round(w, 6))
+            for wp, w in vert_weights
+        ))
     elif s.viz_mode == 'VERTEX_GROUP':
         data_hash = ('VG', s.vgroup_name, len(vert_weights))
+        pos_fp = hash(tuple((round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)) for wp, _ in vert_weights))
     else:
         data_hash = ('SK', s.shape_key_name, len(vert_weights))
-
-    pos_fp = hash(tuple(
-        (round(wp.x, 3), round(wp.y, 3), round(wp.z, 3))
-        for wp, _ in vert_weights
-    ))
+        pos_fp = hash(tuple((round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)) for wp, _ in vert_weights))
     batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(s.alpha_fade, 4))
 
     if VIZ_CACHE.batch is None or VIZ_CACHE.batch_hash != batch_key:
