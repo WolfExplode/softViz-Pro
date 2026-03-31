@@ -466,15 +466,29 @@ def draw_callback():
     if s.viz_mode == 'PROPORTIONAL' and not ts.use_proportional_edit:
         return
 
-    edit_objs = [o for o in ctx.objects_in_mode if o.type == 'MESH']
-    if not edit_objs: return
+    if s.viz_mode in ('SHAPE_KEY', 'VERTEX_GROUP'):
+        if ctx.mode == 'EDIT_MESH':
+            edit_objs = [o for o in ctx.objects_in_mode if o.type == 'MESH']
+        else:
+            edit_objs = [o for o in ctx.selected_objects if o.type == 'MESH']
+            if not edit_objs and ctx.active_object and ctx.active_object.type == 'MESH':
+                edit_objs = [ctx.active_object]
+    else:
+        edit_objs = [o for o in ctx.objects_in_mode if o.type == 'MESH']
+
+    if not edit_objs:
+        return
 
     ramp_node = get_ramp_node()
     ramp = ramp_node.color_ramp if ramp_node else None
 
     bms = {}
-    for obj in edit_objs:
-        bms[obj] = bmesh.from_edit_mesh(obj.data)
+    if s.viz_mode == 'PROPORTIONAL':
+        for obj in edit_objs:
+            bms[obj] = bmesh.from_edit_mesh(obj.data)
+    elif ctx.mode == 'EDIT_MESH' and s.viz_mode in ('SHAPE_KEY', 'VERTEX_GROUP'):
+        for obj in edit_objs:
+            bms[obj] = bmesh.from_edit_mesh(obj.data)
 
     cage_coords_by_obj = {}
     sk_viz = s.viz_mode == 'SHAPE_KEY'
@@ -489,9 +503,9 @@ def draw_callback():
     if s.viz_mode == 'VERTEX_GROUP':
         vert_weights = []
         for obj in edit_objs:
-            bm = bms[obj]
             mat = obj.matrix_world
             cage = cage_coords_by_obj.get(obj)
+            mesh = obj.data
 
             vg = obj.vertex_groups.get(s.vgroup_name) if s.vgroup_name else None
             if not vg:
@@ -499,13 +513,26 @@ def draw_callback():
             if not vg:
                 continue
 
-            dvert_layer = bm.verts.layers.deform.verify()
-            vg_idx = vg.index
-            for v in bm.verts:
-                w = v[dvert_layer].get(vg_idx, 0.0)
-                if w > 0.0:
-                    wp = vert_world_pos(mat, v, cage)
-                    vert_weights.append((wp, w))
+            bm = bms.get(obj)
+            if bm is not None:
+                dvert_layer = bm.verts.layers.deform.verify()
+                vg_idx = vg.index
+                for v in bm.verts:
+                    w = v[dvert_layer].get(vg_idx, 0.0)
+                    if w > 0.0:
+                        wp = vert_world_pos(mat, v, cage)
+                        vert_weights.append((wp, w))
+            else:
+                vg_idx = vg.index
+                for vert in mesh.vertices:
+                    w = 0.0
+                    for ge in vert.groups:
+                        if ge.group == vg_idx:
+                            w = ge.weight
+                            break
+                    if w > 0.0:
+                        wp = vert_world_pos(mat, vert, cage)
+                        vert_weights.append((wp, w))
 
         if not vert_weights: return
 
@@ -526,20 +553,21 @@ def draw_callback():
                 continue
 
             basis = mesh.shape_keys.reference_key
-            bm = bms[obj]
-            bm.verts.ensure_lookup_table()
-            # In shape key edit mode, bmesh only tracks the *active* shape key.
-            # Use live bm coords only when the resolved key matches that active key;
-            # otherwise read sk.data so shape_key_name is honored.
+            bm = bms.get(obj)
+            # In mesh edit + shape key edit mode, bmesh only tracks the *active* key.
             idx_act = obj.active_shape_key_index
             sk_is_active = (
                 0 <= idx_act < len(mesh.shape_keys.key_blocks)
                 and mesh.shape_keys.key_blocks[idx_act] == sk
             )
             in_sk_edit = (
-                obj.use_shape_key_edit_mode and sk is not basis and sk_is_active
+                bm is not None
+                and obj.use_shape_key_edit_mode
+                and sk is not basis
+                and sk_is_active
             )
             if in_sk_edit:
+                bm.verts.ensure_lookup_table()
                 displacements = [
                     (bm.verts[i].co - basis.data[i].co).length
                     for i in range(len(mesh.vertices))
@@ -555,11 +583,19 @@ def draw_callback():
 
             mat = obj.matrix_world
             cage = cage_coords_by_obj.get(obj)
-            for v in bm.verts:
-                d = displacements[v.index]
-                if d > 0.0:
-                    wp = vert_world_pos(mat, v, cage)
-                    vert_weights.append((wp, d / max_d))
+            if bm is not None:
+                bm.verts.ensure_lookup_table()
+                for v in bm.verts:
+                    d = displacements[v.index]
+                    if d > 0.0:
+                        wp = vert_world_pos(mat, v, cage)
+                        vert_weights.append((wp, d / max_d))
+            else:
+                for vert in mesh.vertices:
+                    d = displacements[vert.index]
+                    if d > 0.0:
+                        wp = vert_world_pos(mat, vert, cage)
+                        vert_weights.append((wp, d / max_d))
 
         if not vert_weights: return
 
