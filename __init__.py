@@ -1303,9 +1303,9 @@ class VIEW3D_OT_softviz_toggle(bpy.types.Operator):
 # SETTINGS
 # -------------------------------------------------
 class SoftVizSettings(bpy.types.PropertyGroup):
-    use_xray: bpy.props.BoolProperty(name="X-Ray (Show Through)", default=True)
-    use_screen_space: bpy.props.BoolProperty(name="Constant Screen Size", default=False)
-    dot_size: bpy.props.FloatProperty(default=5.0, min=0.01, max=100.0)
+    use_xray: bpy.props.BoolProperty(name="X-Ray (Show Through)", default=False)
+    use_screen_space: bpy.props.BoolProperty(name="Constant Screen Size", default=True)
+    dot_size: bpy.props.FloatProperty(default=3.0, min=0.01, max=100.0)
     alpha_fade: bpy.props.FloatProperty(default=0.5, min=0.0, max=1.0)
     viz_mode: bpy.props.EnumProperty(
         name="Mode",
