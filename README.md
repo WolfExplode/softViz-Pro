@@ -22,6 +22,5 @@ https://github.com/user-attachments/assets/63165376-0e7f-4fc1-8e5e-905e3ca79b5a
 ## Optimized for viewport
 https://github.com/user-attachments/assets/c13f004e-174c-402b-aa53-a28341368983
 
-## Works in any mode
-Works in edit, object, and sculpt mode
+## Works in edit, object, and sculpt mode
 https://github.com/user-attachments/assets/cf73bdf3-ea5f-4915-95c9-45d585eff368
