@@ -1,8 +1,12 @@
-# SoftViz Pro
+# SoftViz
+Vertex weights visualizer for blender 4.2+
+https://github.com/user-attachments/assets/3e3c523e-89ab-4359-be14-005d48d35d08
 
 Enable the add-on in **Blender 4.2+** under **Edit -> Preferences -> Add-ons**, then in the 3D Viewport press **N**, open the **SoftViz** tab, turn on **SoftViz Heatmap** and **proportional editing**, enter **Edit Mode** on a mesh, and use **G / R / S** to see influence painted on the geometry in real time.
 
 Developer documentation: [Documentation.md](Documentation.md).
+
+
 
 ## Proportional Editing
 https://github.com/user-attachments/assets/f3f38427-af58-456b-9bfc-56cd1bc17b9a
