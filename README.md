@@ -7,8 +7,6 @@ Enable the add-on in **Blender 4.2+** under **Edit -> Preferences -> Add-ons**, 
 
 Developer documentation: [Documentation.md](Documentation.md).
 
-
-
 ## Proportional Editing
 https://github.com/user-attachments/assets/f3f38427-af58-456b-9bfc-56cd1bc17b9a
 
@@ -17,6 +15,9 @@ https://github.com/user-attachments/assets/d5aa9e9b-d35d-4006-bc1d-8a0e0111e8d1
 
 ## Shape Keys
 https://github.com/user-attachments/assets/63165376-0e7f-4fc1-8e5e-905e3ca79b5a
+
+## Materials
+https://github.com/user-attachments/assets/6b307b9a-06d4-47b5-bc42-4675e4a9c987
 
 ## Mirror
 ![WorksWithMirror](https://github.com/user-attachments/assets/c440e654-6221-464e-abf6-a63af5753ef7)
