@@ -545,6 +545,30 @@ def _softviz_resolve_shape_key_object(mesh, settings, obj):
             sk = mesh.shape_keys.key_blocks[idx]
     return sk
 
+def _softviz_resolve_material_object(settings, obj):
+    if settings.material_name:
+        return bpy.data.materials.get(settings.material_name)
+    if obj:
+        return obj.active_material
+    return None
+
+def _softviz_selected_mesh_object(context):
+    obj = context.active_object
+    if obj and obj.type == 'MESH':
+        return obj
+    for candidate in context.selected_objects:
+        if candidate.type == 'MESH':
+            return candidate
+    return None
+
+def _softviz_material_slot_index(obj, material):
+    if not obj or not material:
+        return -1
+    for idx, slot in enumerate(obj.material_slots):
+        if slot.material == material:
+            return idx
+    return -1
+
 def _softviz_edit_vg_sk_cache_signature(settings, edit_objs):
     sk_viz = settings.viz_mode == 'SHAPE_KEY'
     sig = [
@@ -575,6 +599,10 @@ def _softviz_edit_vg_sk_cache_signature(settings, edit_objs):
             else:
                 sig.append(None)
                 sig.append(0.0)
+        elif settings.viz_mode == 'MATERIAL':
+            mat = _softviz_resolve_material_object(settings, obj)
+            sig.append(mat.name if mat else None)
+            sig.append(_softviz_material_slot_index(obj, mat))
     return tuple(sig)
 
 def _softviz_proportional_cache_key_elements(ts, edit_objs, bm_by_obj, sel_by_name=None):
@@ -681,7 +709,13 @@ def draw_callback():
     if s.viz_mode == 'PROPORTIONAL' and not ts.use_proportional_edit:
         return
 
-    if s.viz_mode in ('SHAPE_KEY', 'VERTEX_GROUP'):
+    if s.viz_mode == 'MATERIAL':
+        edit_objs = []
+        material_obj = _softviz_selected_mesh_object(ctx)
+        if not material_obj:
+            return
+        edit_objs = [material_obj]
+    elif s.viz_mode in ('SHAPE_KEY', 'VERTEX_GROUP'):
         if ctx.mode == 'EDIT_MESH':
             edit_objs = [o for o in ctx.objects_in_mode if o.type == 'MESH']
         else:
@@ -704,7 +738,7 @@ def draw_callback():
         VIZ_CACHE.edit_vw_list = None
         VIZ_CACHE.edit_vw_sig = None
 
-    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY') and ctx.mode != 'EDIT_MESH':
+    if s.viz_mode in ('VERTEX_GROUP', 'SHAPE_KEY', 'MATERIAL') and ctx.mode != 'EDIT_MESH':
         VIZ_CACHE.edit_vw_list = None
         VIZ_CACHE.edit_vw_sig = None
 
@@ -848,6 +882,34 @@ def draw_callback():
                         if d > 0.0:
                             wp = vert_world_pos(mat, vert, cage)
                             vert_weights.append((wp, d / max_d))
+
+            if not vert_weights: return
+
+        # ------- MATERIAL mode -------
+        elif s.viz_mode == 'MATERIAL':
+            vert_weights = []
+            obj = edit_objs[0]
+            mesh = obj.data
+            material = _softviz_resolve_material_object(s, obj)
+            if not material:
+                return
+
+            mat_idx = _softviz_material_slot_index(obj, material)
+            if mat_idx < 0:
+                return
+
+            mw = obj.matrix_world
+            cage = cage_coords_by_obj.get(obj.name)
+            seen = set()
+            for poly in mesh.polygons:
+                if poly.material_index != mat_idx:
+                    continue
+                for v_idx in poly.vertices:
+                    if v_idx in seen:
+                        continue
+                    seen.add(v_idx)
+                    wp = vert_world_pos(mw, mesh.vertices[v_idx], cage)
+                    vert_weights.append((wp, 1.0))
 
             if not vert_weights: return
 
@@ -1053,6 +1115,8 @@ def draw_callback():
     else:
         if s.viz_mode == 'VERTEX_GROUP':
             data_hash = ('VG', s.vgroup_name, len(vert_weights))
+        elif s.viz_mode == 'MATERIAL':
+            data_hash = ('MAT', s.material_name, len(vert_weights))
         else:
             data_hash = ('SK', s.shape_key_name, len(vert_weights))
         h_pos = _softviz_blake2b16()
@@ -1064,7 +1128,8 @@ def draw_callback():
                 round(wp.z * COORD_HASH_QUANT),
             )
         pos_fp = h_pos.digest()
-    batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(s.alpha_fade, 4))
+    alpha_fade = 0.3 if s.viz_mode == 'MATERIAL' else s.alpha_fade
+    batch_key = (data_hash, pos_fp, VIZ_CACHE.ramp_lut_key, round(alpha_fade, 4))
 
     if VIZ_CACHE.batch is None or VIZ_CACHE.batch_hash != batch_key:
         positions = []
@@ -1072,13 +1137,13 @@ def draw_callback():
         color_list = []
         indices = []
         vc = 0
-        alpha_fade = s.alpha_fade
-
         for wp, w in vert_weights:
             if lut is not None:
                 r, g, b, a = lut[min(255, int(w * 255))]
             else:
                 r, g, b, a = (1.0, 0.0, 0.0, 1.0)
+            if s.viz_mode == 'MATERIAL':
+                a = 0.0
             a = (a * (1.0 - alpha_fade)) + (w * alpha_fade)
             col = (r, g, b, a)
 
@@ -1313,11 +1378,13 @@ class SoftVizSettings(bpy.types.PropertyGroup):
             ('PROPORTIONAL', "Proportional", "Visualize proportional editing influence"),
             ('VERTEX_GROUP', "Vertex Group", "Visualize vertex group weights"),
             ('SHAPE_KEY', "Shape Key", "Visualize shape key displacement per vertex"),
+            ('MATERIAL', "Material", "Visualize the vertices used by the selected material"),
         ],
         default='PROPORTIONAL',
     )
     vgroup_name: bpy.props.StringProperty(name="Vertex Group", default="")
     shape_key_name: bpy.props.StringProperty(name="Shape Key", default="")
+    material_name: bpy.props.StringProperty(name="Material", default="")
 
 # -------------------------------------------------
 # UI
@@ -1399,9 +1466,9 @@ class VIEW3D_PT_softviz_mode(bpy.types.Panel):
     def draw(self, context):
         l = self.layout
         s = context.scene.softviz_settings
-        obj = context.active_object
+        obj = _softviz_selected_mesh_object(context)
 
-        l.row().prop(s, "viz_mode", expand=True)
+        l.row().prop(s, "viz_mode", text="")
 
         if s.viz_mode == 'VERTEX_GROUP':
             if obj and obj.type == 'MESH' and obj.vertex_groups:
@@ -1414,6 +1481,12 @@ class VIEW3D_PT_softviz_mode(bpy.types.Panel):
                 l.prop_search(s, "shape_key_name", obj.data.shape_keys, "key_blocks", text="Key")
             else:
                 l.label(text="No shape keys found", icon='INFO')
+
+        elif s.viz_mode == 'MATERIAL':
+            if obj and obj.material_slots:
+                l.prop_search(s, "material_name", obj, "material_slots", text="Material")
+            else:
+                l.label(text="No materials found", icon='INFO')
 
 # -------------------------------------------------
 # REGISTER
